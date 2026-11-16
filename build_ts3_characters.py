@@ -141,7 +141,29 @@ def map_ts3_bone_to_di3(ts3_bname: str, di3_bones: list[str]) -> str:
         return pick("Spine3", "Spine2", "Spine1", "Hips")
     if ts3_bname == "Neck":
         return pick("Neck", "Spine3")
-    if ts3_bname in ("Head", "Hat", "Jaw", "UpperLip", "LowerLip", "MiddleBrow", "MidddleBrow", "BrowMiddle") or ts3_bname.lower().startswith(("hair", "eye", "lid", "lip", "brow")):
+    # Facial bones (Jaw, lips, brows) + Jessie's hair braid match DI3's skeleton
+    low = ts3_bname.lower()
+    if low == "jaw":
+        return pick("Jaw", "Head")
+    if low == "upperlip":
+        return pick("UpperLip", "Head")
+    if low == "lowerlip":
+        return pick("LowerLip", "Head")
+    if low == "lipcornerleft":
+        return pick("CornerLipLeft", "Head")
+    if low == "lipcornerright":
+        return pick("CornerLipRight", "Head")
+    if low == "browleft":
+        return pick("BrowLeft", "Head")
+    if low == "browright":
+        return pick("BrowRight", "Head")
+    if low in ("middlebrow", "midddlebrow", "browmiddle"):
+        return pick("BrowCenter", "Head")
+    if low == "hair1":
+        return pick("Hair01", "Head")
+    if low in ("hair2", "hair3", "hair4"):
+        return pick("Hair02", "Hair01", "Head")
+    if ts3_bname in ("Head", "Hat") or low.startswith(("eye", "lid")):
         return pick("Head", "Neck")
 
     if side:
