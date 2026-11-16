@@ -46,53 +46,61 @@ CHARACTERS = [
     {
         "name": "T3_Woody",
         "base": "TS_Woody",
+        "actor_key": "av_woody",
+        "parms_extra": "",
         "ts3_dir": "woody",
         "ts3_zip": "woody.zip",
         "skip_mats": {"EyeLid_RightUpper1", "EyeLid_RightLower1", "EyeLid_LeftUpper1", "EyeLid_LeftLower1"},
         "mat_guid": b"b3000001-0001-4000-8000-000000000001",
-        "mat_hash": bytes.fromhex("b3000001"),
-        "diff_hash": "b300000000000001",
-        "norm_hash": "b300000000000002",
-        "prog_tree": "IN3_TS_Woody",
+        "mat_hash": bytes.fromhex("b3010001"),
+        "diff_hash": "b301000100000001",
+        "norm_hash": "b301000200000002",
+        "prog_tree": "IN1_TS_Woody",
         "scale_to_base": True,
     },
     {
         "name": "T3_Jessie",
         "base": "TS_Jessie",
+        "actor_key": "av_jessie",
+        "parms_extra": "",
         "ts3_dir": "jessie",
         "ts3_zip": "jessie.zip",
         "skip_mats": {"_EyeLid_Upper_RIGHT", "_EyeLid_Lower_RIGHT", "_EyeLid_Upper_LEFT", "_EyeLid_Lower_LEFT"},
         "mat_guid": b"b3000002-0002-4000-8000-000000000002",
-        "mat_hash": bytes.fromhex("b3000002"),
-        "diff_hash": "b300000000000003",
-        "norm_hash": "b300000000000004",
-        "prog_tree": "IN3_TS_Jessie",
+        "mat_hash": bytes.fromhex("b3020001"),
+        "diff_hash": "b302000100000003",
+        "norm_hash": "b302000200000004",
+        "prog_tree": "IN1_TS_Jessie",
         "scale_to_base": True,
     },
     {
         "name": "T3_Buzz",
         "base": "TS_Buzz",
+        "actor_key": "av_buzz",
+        "parms_extra": "; modelDef=Avatar_Buzz_Classic;",
         "ts3_dir": "buzzlightyear",
         "ts3_zip": "buzzlightyear.zip",
         "skip_mats": {"Dome3", "wings_n_such_Buzz_bindpose2_JetPack_Flame4", "wings_n_such_Buzz_bindpose2_JetPack_Flame3"},
         "mat_guid": b"b3000003-0003-4000-8000-000000000003",
-        "mat_hash": bytes.fromhex("b3000003"),
-        "diff_hash": "b300000000000005",
-        "norm_hash": "b300000000000006",
-        "prog_tree": "IN3_TS_Buzz",
+        "mat_hash": bytes.fromhex("b3030001"),
+        "diff_hash": "b303000100000005",
+        "norm_hash": "b303000200000006",
+        "prog_tree": "IN1_TS_Buzz",
         "scale_to_base": True,
     },
     {
         "name": "T3_Zurg",
         "base": "TS_Buzz",
+        "actor_key": "av_buzz",
+        "parms_extra": "; modelDef=Avatar_Buzz_Classic;",
         "ts3_dir": "zurgavatar",
         "ts3_zip": "zurgavatar.zip",
         "skip_mats": {"Smokey_plastic", "Zurg_gun_mat", "Yellow_ball"},
         "mat_guid": b"b3000004-0004-4000-8000-000000000004",
-        "mat_hash": bytes.fromhex("b3000004"),
-        "diff_hash": "b300000000000007",
-        "norm_hash": "b300000000000008",
-        "prog_tree": "IN3_TS_Buzz",
+        "mat_hash": bytes.fromhex("b3040001"),
+        "diff_hash": "b304000100000007",
+        "norm_hash": "b304000200000008",
+        "prog_tree": "IN1_TS_Buzz",
         "scale_to_base": False,  # Keep Zurg taller than Buzz
     },
 ]
@@ -450,6 +458,26 @@ def rotate_arms_to_apose(pos: np.ndarray, nrm: np.ndarray, ts_bnames: list[list[
     return out_pos, out_nrm
 
 
+def detail_parent(di3_bone: str):
+    if di3_bone.startswith(("Jaw", "UpperLip", "LowerLip", "CornerLip", "Brow", "Hair")):
+        return "Head"
+    if di3_bone.startswith(("Index1_", "Middle1_", "Thumb1_")):
+        return "Hand_" + di3_bone.split("_")[-1]
+    return None
+
+
+# Maps every TS3 bone to a DI3 bone. A face/finger/hair bone whose DI3 pivot sits more than 3 cm from the posed
+# TS3 joint goes to its parent (Head/Hand) instead: animating it would swing the vertices around a far pivot
+# (twisted mouth on Jessie, flying claws on Zurg). Moving the mesh onto the DI3 joints was measured to tear Zurg.
+def ts3_bone_map(ts_bnames, joints, di3_pos, bone_names):
+    mapped = {bn: map_ts3_bone_to_di3(bn, bone_names) for row in ts_bnames for bn in row}
+    for tb, db in mapped.items():
+        parent = detail_parent(db)
+        if parent and (tb not in joints or np.linalg.norm(joints[tb] - di3_pos[db]) > 0.03):
+            mapped[tb] = parent
+    return mapped
+
+
 def vertex_normals(verts, faces):
     fn = np.cross(verts[faces[:, 1]] - verts[faces[:, 0]], verts[faces[:, 2]] - verts[faces[:, 0]])
     n = np.zeros_like(verts)
@@ -478,7 +506,9 @@ def vertex_tangents(verts, uvs, normals, faces):
     return tan, w
 
 
-def write_dds(img: Image.Image, fmt: str, path: Path):
+# Writes a PC .tbody (DDS). The engine reads dwCaps3 bit0 as sRGB and dwCaps4 as the U/V/W wrap mode.
+# Leaving both at 0 gives washed-out colours and an invalid sampler; 0x49 = Wrap on all axes, as on vanilla textures.
+def write_dds(img: Image.Image, fmt: str, path: Path, srgb: bool):
     levels, size = [], img.size
     cur = img
     while True:
@@ -491,12 +521,17 @@ def write_dds(img: Image.Image, fmt: str, path: Path):
     header = struct.pack("<4s7I44s2I4s5I5I", b"DDS ", 124, 0x000A1007, size[1], size[0],
                          len(levels[0]), 0, len(levels), b"\0" * 44,
                          32, 0x4, fmt.encode(), 0, 0, 0, 0, 0,
-                         0x401008, 0, 0, 0, 0)
+                         0x401008, 0, int(srgb), 0x49, 0)
     path.write_bytes(header + b"".join(levels))
 
 
 def patch_oct(base_info, n_body: int, idx_count: int, bounds, base_name: str, new_name: str):
-    data = bytearray(base_info["oct"])
+    raw = bytearray(base_info["oct"])
+    str_sz, _, data_sz = struct.unpack_from("<III", raw, 12)
+    data_start = len(raw) - data_sz
+    head_part = bytearray(raw[:data_start])
+    data_part = bytearray(raw[data_start:])
+
     i24 = lambda *v: b"".join(struct.pack("<i", x)[:3] for x in v)
     u16 = lambda *v: b"".join(struct.pack("<H", x) for x in v)
     f32 = lambda *v: struct.pack(f"<{len(v)}f", *v)
@@ -508,19 +543,14 @@ def patch_oct(base_info, n_body: int, idx_count: int, bounds, base_name: str, ne
     new_vbuf_len = n_all * 40
     new_ibuf_len = (idx_count + 3 * n_dummy_tris) * 2
 
-    def replace_unique(old_b, new_b, label):
-        pos = data.find(old_b)
-        assert pos >= 0, f"missing {label}: {old_b.hex()}"
-        assert data.find(old_b, pos + 1) < 0, f"non-unique {label}: {old_b.hex()}"
-        data[pos:pos + len(old_b)] = new_b
+    def replace_in_data(old_b, new_b, label):
+        pos = data_part.find(old_b)
+        assert pos >= 0, f"missing {label} in oct data section: {old_b.hex()}"
+        assert data_part.find(old_b, pos + 1) < 0, f"non-unique {label} in oct data section: {old_b.hex()}"
+        data_part[pos:pos + len(old_b)] = new_b
 
-    def replace_first(old_b, new_b, label):
-        pos = data.find(old_b)
-        assert pos >= 0, f"missing {label}: {old_b.hex()}"
-        data[pos:pos + len(old_b)] = new_b
-
-    replace_unique(i24(base_info["vbuf_len"]), i24(new_vbuf_len), "vbuf_len")
-    replace_first(i24(base_info["ibuf_len"]), i24(new_ibuf_len), "ibuf_len")
+    replace_in_data(i24(base_info["vbuf_len"]), i24(new_vbuf_len), "vbuf_len")
+    replace_in_data(i24(base_info["ibuf_len"]), i24(new_ibuf_len), "ibuf_len")
 
     for k, prim in enumerate(base_info["prims"]):
         if k == 0:
@@ -534,30 +564,33 @@ def patch_oct(base_info, n_body: int, idx_count: int, bounds, base_name: str, ne
             new_vdata = i24(2, 3, 0, v_off_idx * 16, 16, 0, s1 + v_off_idx * 24, 24)
 
         old_i24 = i24(*prim["idata"])
-        if all(0 <= x <= 65535 for x in prim["idata"]) and data.find(u16(*prim["idata"])) >= 0:
+        if all(0 <= x <= 65535 for x in prim["idata"]) and data_part.find(u16(*prim["idata"])) >= 0:
             old_u16 = u16(*prim["idata"])
-            pos_i = data.find(old_u16)
-            data[pos_i:pos_i + len(old_u16)] = u16(*new_vals)
+            pos_i = data_part.find(old_u16)
+            data_part[pos_i:pos_i + len(old_u16)] = u16(*new_vals)
         else:
-            pos_i = data.find(old_i24)
+            pos_i = data_part.find(old_i24)
             assert pos_i >= 0, f"missing idata[{k}]"
-            data[pos_i:pos_i + len(old_i24)] = i24(*new_vals)
+            data_part[pos_i:pos_i + len(old_i24)] = i24(*new_vals)
 
         old_vdata = i24(*prim["vdata"])
-        pos_v = data.find(old_vdata)
+        pos_v = data_part.find(old_vdata)
         assert pos_v >= 0, f"missing vdata[{k}]"
-        data[pos_v:pos_v + len(old_vdata)] = new_vdata
+        data_part[pos_v:pos_v + len(old_vdata)] = new_vdata
 
     bmin, bmax, center, radius = bounds
-    replace_unique(f32(*base_info["bbox"]), f32(*bmin, *bmax), "bbox")
+    replace_in_data(f32(*base_info["bbox"]), f32(*bmin, *bmax), "bbox")
 
+    # Rename strings strictly within the string table
     lbase, lname = base_name.lower(), new_name.lower()
-    out = bytes(data)
-    out = out.replace(f"{lbase}_0.vbuf\0".encode(), f"{lname}_0.vbuf\0".encode())
-    out = out.replace(f"{lbase}_0.ibuf\0".encode(), f"{lname}_0.ibuf\0".encode())
-    out = out.replace(f"{lbase}.mtb\0".encode(), f"{lname}.mtb\0".encode())
-    out = out.replace(lbase.encode(), lname.encode())
-    return out
+    str_end = min(len(head_part), str_sz + 64)
+    str_sec = bytes(head_part[:str_end])
+    str_sec = str_sec.replace(f"{lbase}_0.vbuf\0".encode(), f"{lname}_0.vbuf\0".encode())
+    str_sec = str_sec.replace(f"{lbase}_0.ibuf\0".encode(), f"{lname}_0.ibuf\0".encode())
+    str_sec = str_sec.replace(f"{lbase}.mtb\0".encode(), f"{lname}.mtb\0".encode())
+    str_sec = str_sec.replace(lbase.encode(), lname.encode())
+    head_part[:str_end] = str_sec
+    return bytes(head_part) + bytes(data_part)
 
 
 def patch_mtb(base_info, spec):
@@ -572,6 +605,16 @@ def patch_mtb(base_info, spec):
     assert guids, "no GUID in mtb"
     g0 = guids[0]
     data[g0.start():g0.end()] = spec["mat_guid"]
+
+    # Patch materialHashes[0] in MATP so characters cloned from the same base (or vanilla)
+    # do not collide in Material::FindCachedMaterial(uint32_t hash).
+    matp = data.find(b"MATP")
+    assert matp >= 0, "missing MATP in mtb"
+    num_mats = struct.unpack_from("<I", data, matp + 12)[0]
+    pos = guids[-1].end() + 1  # past trailing NUL of last GUID
+    pos = (pos + 1) & ~1       # align 2 for uint16 shaderIds[num_mats]
+    pos_hashes = (pos + num_mats * 2 + 3) & ~3  # align 4 for uint32 materialHashes[num_mats]
+    data[pos_hashes:pos_hashes + 4] = spec["mat_hash"]
     return bytes(data)
 
 
@@ -598,7 +641,7 @@ def main():
 
     shutil.rmtree(MOD_OUT, ignore_errors=True)
     MOD_OUT.mkdir(parents=True)
-    tex_out = BUILD / "textures"
+    tex_out = MOD_OUT / "textures"
     tex_out.mkdir(parents=True, exist_ok=True)
 
     actor_patches = []
@@ -624,10 +667,19 @@ def main():
 
         # Scale uniformly and place feet at y=0
         scaled_pos = ts_pos * scale
-        scaled_pos[:, 1] -= float(scaled_pos[:, 1].min())
+        floor = float(scaled_pos[:, 1].min())
+        scaled_pos[:, 1] -= floor
 
         # Rotate ONLY the arms from T-pose into DI3's A-pose
         baked, bnormals = rotate_arms_to_apose(scaled_pos, ts_nrm, ts_bnames, ts_bw, ts3_bone_pos, di3_pos, scale)
+
+        # Pose the TS3 joints exactly like the mesh to compare them with the DI3 pivots
+        jn = list(ts3_bone_pos)
+        jp = np.array([ts3_bone_pos[k] for k in jn]) * scale
+        jposed, _ = rotate_arms_to_apose(jp, np.zeros_like(jp), [[k] * 4 for k in jn],
+                                         np.tile([255, 0, 0, 0], (len(jn), 1)), ts3_bone_pos, di3_pos, scale)
+        jposed[:, 1] -= floor
+        bone_map = ts3_bone_map(ts_bnames, dict(zip(jn, jposed)), di3_pos, bone_names)
         bnormals /= np.maximum(np.linalg.norm(bnormals, axis=1, keepdims=True), 1e-12)
 
         # Check winding sign against DI3 base
@@ -637,8 +689,13 @@ def main():
         if base_info["winding"] * ts_sign < 0:
             bnormals = -bnormals
 
-        # Recompute smooth vertex normals & tangents on the posed mesh
-        bnormals = vertex_normals(baked, vfaces) * base_info["winding"]
+        # Recompute smooth vertex normals & tangents on the posed mesh, guarding against zero-area faces
+        recomp = vertex_normals(baked, vfaces) * base_info["winding"]
+        zero_recomp = np.linalg.norm(recomp, axis=1) < 1e-4
+        bnormals = np.where(zero_recomp[:, None], bnormals, recomp)
+        zero_all = np.linalg.norm(bnormals, axis=1) < 1e-4
+        bnormals[zero_all] = [0.0, 0.0, 1.0]
+        bnormals /= np.maximum(np.linalg.norm(bnormals, axis=1, keepdims=True), 1e-12)
         tangents, tsign = vertex_tangents(baked, ts_uv, bnormals, vfaces)
 
         # Map TS3 bone names directly to DI3 skeleton indices
@@ -647,7 +704,7 @@ def main():
         for vi, row in enumerate(ts_bnames):
             for k, bn in enumerate(row):
                 if bn not in bone_cache:
-                    bone_cache[bn] = bone_names.index(map_ts3_bone_to_di3(bn, bone_names))
+                    bone_cache[bn] = bone_names.index(bone_map[bn])
                 idx[vi, k] = bone_cache[bn]
         wq = ts_bw.astype(np.uint8)
 
@@ -697,8 +754,8 @@ def main():
         dnax = re.sub(rb"characters/" + lbase.encode() + rb"/" + lbase.encode() + rb"\.animtreeoverrides(?=\x00)", model_path + b".animtreeoverrides", dnax, flags=re.IGNORECASE)
         (char_dir / f"{lname}.dnax").write_bytes(dnax)
 
-        write_dds(atlas, "DXT1", tex_out / f"{spec['diff_hash']}.tbody")
-        write_dds(Image.new("RGBA", (256, 256), FLAT_NORMAL_RGBA), "DXT5", tex_out / f"{spec['norm_hash']}.tbody")
+        write_dds(atlas, "DXT1", tex_out / f"{spec['diff_hash']}.tbody", srgb=True)
+        write_dds(Image.new("RGBA", (256, 256), FLAT_NORMAL_RGBA), "DXT5", tex_out / f"{spec['norm_hash']}.tbody", srgb=False)
 
         (MOD_OUT / "characters" / f"{name}.lua").write_text(
             f"-- {name} (Toy Story 3 port, cloned from {base})\n"
@@ -707,20 +764,18 @@ def main():
             f'    ProgressionTree = "{spec["prog_tree"]}",\n'
             "})\n", encoding="utf-8")
 
-        actor_patches.append((lbase, lname, name))
-        datamap_patches.append((lbase, lname))
+        actor_patches.append((spec["actor_key"], lname, name, spec["parms_extra"]))
+        datamap_patches.append((spec["actor_key"], lbase, lname))
         print(f"  OK: {n_body} verts, {len(vfaces)} tris, bbox={bmin.round(2)}..{bmax.round(2)}")
 
-    print("\n=== Packing textures/b3.zip ===")
-    b3_zip = build_b3_texture_zip(tex_out)
-    (MOD_OUT / "textures").mkdir(parents=True, exist_ok=True)
-    shutil.copy2(b3_zip, MOD_OUT / "textures" / "b3.zip")
+    print(f"\n=== Loose textures written to {tex_out} (CrabeLoader V2 VFS) ===")
 
     skill_dir = MOD_OUT / "skilltrees"
     skill_dir.mkdir(parents=True, exist_ok=True)
 
     actor_lines = [
         "-- Registers T3_Woody, T3_Jessie, T3_Buzz, T3_Zurg in ActorList.",
+        "-- Note: DI 1.0 Toy Story actors use av_woody / av_jessie / av_buzz in ActorList.",
         "if Data and Data.DBName == \"ActorList\" and Data.Records then",
         "    local recs = Data.Records",
         "    local existing = {}",
@@ -730,40 +785,42 @@ def main():
         "        i = i + 1",
         "    end",
     ]
-    for lbase, lname, name in actor_patches:
+    for actor_key, lname, name, parms_extra in actor_patches:
         actor_lines.append(
-            f'    if existing["{lbase}"] and not existing["{lname}"] then '
-            f'recs[#recs + 1] = {{ Parms = "DNAFile=characters/{name}/{name}.dnax", Type = "Avatar", Name = "{lname}" }} '
+            f'    if existing["{actor_key}"] and not existing["{lname}"] then '
+            f'recs[#recs + 1] = {{ Parms = "DNAFile=characters/{name}/{name}.dnax{parms_extra}", Type = "Avatar", Name = "{lname}" }} '
             f'existing["{lname}"] = true end'
         )
     actor_lines.append("end")
     (skill_dir / "ActorList.patch").write_text("\n".join(actor_lines) + "\n", encoding="utf-8")
 
     dm_lines = [
-        "-- Clones DataMap.Actor and DataMap.Costume preload entries for TS3 characters.",
-        "local function cloneFiles(files, from, to)",
+        "-- Clones DataMap.Actor preload entries for TS3 characters.",
+        "local function cloneFiles(files, lbase, lname)",
         "    local out = {}",
+        "    local dnaFrom = \"DNA|characters/\" .. lbase",
+        "    local dnaTo = \"DNA|characters/\" .. lname .. \"/\" .. lname",
+        "    local entFrom = \"Entity|characters/\" .. lbase .. \"/\" .. lbase",
+        "    local entTo = \"Entity|characters/\" .. lname .. \"/\" .. lname",
+        "    local hasEnt = false",
         "    local i = 1",
         "    while files and i <= #files do",
         "        local v = files[i]",
-        "        if v == from then v = to end",
+        "        if v == dnaFrom then v = dnaTo end",
+        "        if v == entFrom then v = entTo hasEnt = true end",
         "        out[i] = v",
         "        i = i + 1",
         "    end",
+        "    if not hasEnt then out[#out + 1] = entTo end",
         "    return out",
         "end",
         "local A = DataMap and DataMap.Actor",
-        "local C = DataMap and DataMap.Costume",
     ]
-    for lbase, lname in datamap_patches:
+    for actor_key, lbase, lname in datamap_patches:
         dm_lines.extend([
-            f'if A and A["{lbase}"] and not A["{lname}"] then',
-            f'    local src = A["{lbase}"]',
-            f'    A["{lname}"] = {{ Includes = src.Includes, Files = cloneFiles(src.Files, "DNA|characters/{lbase}", "DNA|characters/{lname}/{lname}") }}',
-            "end",
-            f'if C and C["{lbase}_default"] and not C["{lname}_default"] then',
-            f'    local src = C["{lbase}_default"]',
-            f'    C["{lname}_default"] = {{ Files = cloneFiles(src.Files, "Entity|characters/{lbase}/{lbase}", "Entity|characters/{lname}/{lname}") }}',
+            f'if A and A["{actor_key}"] and not A["{lname}"] then',
+            f'    local src = A["{actor_key}"]',
+            f'    A["{lname}"] = {{ Includes = src.Includes, Files = cloneFiles(src.Files, "{lbase}", "{lname}") }}',
             "end",
         ])
     (skill_dir / "DataMap.patch").write_text("\n".join(dm_lines) + "\n", encoding="utf-8")
