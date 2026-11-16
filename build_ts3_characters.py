@@ -66,6 +66,7 @@ CHARACTERS = [
         "ts3_dir": "jessie",
         "ts3_zip": "jessie.zip",
         "skip_mats": {"_EyeLid_Upper_RIGHT", "_EyeLid_Lower_RIGHT", "_EyeLid_Upper_LEFT", "_EyeLid_Lower_LEFT"},
+        "double_sided_mats": {"jessie_hairhat4", "hat_Jessie_HatPiping"},
         "mat_guid": b"b3000002-0002-4000-8000-000000000002",
         "mat_hash": bytes.fromhex("b3020001"),
         "diff_hash": "b302000100000003",
@@ -101,7 +102,14 @@ CHARACTERS = [
         "diff_hash": "b304000100000007",
         "norm_hash": "b304000200000008",
         "prog_tree": "IN1_TS_Buzz",
-        "scale_to_base": False,  # Keep Zurg taller than Buzz
+        "scale_to_base": True,
+        # Buzz's skeleton put Zurg's joints 40-70 cm off; the DI1 TS_Zurg rig has his proportions (body = prim 2)
+        "model_base": "TS_Zurg",
+        "body_prim": 2,
+        "body_tex": (4, 5),
+        "retarget_arms": True,
+        # Buzz's actor auto-starts ABILITY_BUZZ = the jetpack on his back; Zurg has none (POWERUP_BUZZ is AutoStartTool5)
+        "dnax_replace": {b"ABILITY_BUZZ": b"POWERUP_BUZZ"},
     },
 ]
 
@@ -265,7 +273,7 @@ def load_ts3_character(spec):
         if scr is not None:
             sc_id = int(scr.find("entry").text)
             remap = [int(x.text) for x in scs[sc_id].findall("./RemapData/entry")]
-        prims.append((vs_ids, is_id, tex_name, remap))
+        prims.append((vs_ids, is_id, tex_name, remap, mat_name))
         if tex_name not in used_tex_names:
             used_tex_names.append(tex_name)
 
@@ -289,7 +297,7 @@ def load_ts3_character(spec):
     all_pos, all_nrm, all_uv, all_faces = [], [], [], []
     all_bnames, all_bweights = [], []  # per-vertex 4 bone names + 4 uint8 weights
     v_base = 0
-    for vs_ids, is_id, tex_name, remap in prims:
+    for vs_ids, is_id, tex_name, remap, mat_name in prims:
         vs0 = vstreams[vs_ids[0]]
         nv = int(vs0.findtext("Length"))
         w0 = int(vs0.findtext("Width"))
@@ -337,6 +345,16 @@ def load_ts3_character(spec):
         all_bweights.append(v_bw)
         v_base += len(used_v)
 
+        # TS3 drew these double-sided; DI3 culls back faces, so add a reversed copy (Jessie's hat brim from below)
+        if mat_name in spec.get("double_sided_mats", ()):
+            all_pos.append(pos[used_v])
+            all_nrm.append(-nrm[used_v])
+            all_uv.append(all_uv[-1])
+            all_faces.append(tris_local[:, ::-1] + len(used_v))
+            all_bnames.extend(v_bnames)
+            all_bweights.append(v_bw)
+            v_base += len(used_v)
+
     return (
         np.vstack(all_pos),
         np.vstack(all_nrm),
@@ -353,11 +371,19 @@ def load_di3_base(base_name: str):
     """Extracts DI3 base character and parses skeleton, primitives, and winding."""
     lbase = base_name.lower()
     work = RAW / "di3" / lbase
+    loose = DI3_GAME / "assets" / "characters" / lbase
+    exts = (".oct", ".mtb", ".bent", "_0.vbuf", "_0.ibuf", ".animtreeoverrides")
     if not (work / f"{lbase}.xml").exists():
-        z = DI3_GAME / "assets" / "characters" / lbase / f"{lbase}.zip"
-        for pat in (f"*{lbase}.oct", f"*{lbase}.mtb", f"*{lbase}.bent", f"*{lbase}_0.vbuf", f"*{lbase}_0.ibuf", f"*{lbase}.animtreeoverrides"):
-            quickbms_extract(z, pat, work)
-        quickbms_extract(DI3_GAME / "assets" / "characters" / "characters.zip", f"*{lbase}.dnax", work / "dnax")
+        if (loose / f"{lbase}_0.vbuf").exists():
+            # Model-only bases such as TS_Zurg ship loose files and have no dnax in characters.zip
+            work.mkdir(parents=True, exist_ok=True)
+            for ext in exts:
+                shutil.copy2(loose / f"{lbase}{ext}", work / f"{lbase}{ext}")
+        else:
+            z = loose / f"{lbase}.zip"
+            for ext in exts:
+                quickbms_extract(z, f"*{lbase}{ext}", work)
+            quickbms_extract(DI3_GAME / "assets" / "characters" / "characters.zip", f"*{lbase}.dnax", work / "dnax")
         oct_file = next(work.rglob(f"{lbase}.oct"))
         run_c2di_dec(oct_file, work / f"{lbase}.xml")
 
@@ -367,7 +393,7 @@ def load_di3_base(base_name: str):
     vbuf_file = next(work.rglob(f"{lbase}_0.vbuf"))
     ibuf_file = next(work.rglob(f"{lbase}_0.ibuf"))
     anim_file = next(work.rglob(f"{lbase}.animtreeoverrides"))
-    dnax_file = next((work / "dnax").rglob(f"{lbase}.dnax"))
+    dnax_file = next((work / "dnax").rglob(f"{lbase}.dnax"), None)
 
     xml_text = (work / f"{lbase}.xml").read_text(errors="ignore")
     found = re.findall(
@@ -407,7 +433,7 @@ def load_di3_base(base_name: str):
         "vbuf_len": len(vbuf),
         "ibuf_len": len(ibuf),
         "anim": anim_file.read_bytes(),
-        "dnax": dnax_file.read_bytes(),
+        "dnax": dnax_file.read_bytes() if dnax_file else None,
         "bone_names": names,
         "bone_world": np.array(world),
         "prims": prims,
@@ -478,6 +504,59 @@ def ts3_bone_map(ts_bnames, joints, di3_pos, bone_names):
     return mapped
 
 
+# Hand edits made in Blender (tools/blender_export_edits.py): vertex positions and skin weights that replace the
+# computed ones. Vertex order must be unchanged, so only moving vertices and painting weights are allowed.
+def load_hand_edit(lname: str, n_body: int, bone_names: list[str]):
+    path = MOD_ROOT / "edits" / f"{lname}.npz"
+    if not path.exists():
+        return None
+    e = np.load(path)
+    assert len(e["pos"]) == n_body, f"{path}: {len(e['pos'])} vertices, build has {n_body} (vertices added or deleted?)"
+    assert [str(s) for s in e["bone_names"]] == bone_names, f"{path}: skeleton differs from the build"
+    return e
+
+
+# Maps segment a->b onto a2->b2: rotate onto the new direction and stretch along the axis only (thickness kept).
+def _segment_map(pts, a, b, a2, b2):
+    d, d2 = b - a, b2 - a2
+    rot, _ = Rotation.align_vectors([d2 / np.linalg.norm(d2)], [d / np.linalg.norm(d)])
+    u = d / np.linalg.norm(d)
+    rel = pts - a
+    rel = rel + np.outer(rel @ u, u) * (np.linalg.norm(d2) / np.linalg.norm(d) - 1.0)
+    return a2 + rot.apply(rel)
+
+
+# Puts the TS3 shoulder, elbow and wrist exactly on the DI3 Shoulder/Elbow/Hand bones so the arm pieces pivot where
+# the DI3 animations expect (Zurg's hands flew off his forearms 26-30 cm otherwise). Upper arm maps shoulder->elbow,
+# forearm and hand map elbow->wrist; vertices blend by skin weight, everything else stays put. Returns new joints too.
+def retarget_arms(pos, ts_bnames, ts_bw, joints, di3_pos):
+    out = pos.copy()
+    joints = dict(joints)
+    for side in ("Left", "Right"):
+        s, e, h = (f"Bicep{side}", f"Forearm{side}", f"Hand{side}")
+        if not all(k in joints for k in (s, e, h)):
+            continue
+        S2, E2, H2 = di3_pos[f"Shoulder_{side}"], di3_pos[f"Elbow_{side}"], di3_pos[f"Hand_{side}"]
+        upper = _segment_map(pos, joints[s], joints[e], S2, E2)
+        fore = _segment_map(pos, joints[e], joints[h], E2, H2)
+        w_up = np.zeros(len(pos))
+        w_fo = np.zeros(len(pos))
+        for vi, (row, w) in enumerate(zip(ts_bnames, ts_bw)):
+            for bn, wt in zip(row, w):
+                if side not in bn or not wt:
+                    continue
+                if bn.startswith("Bicep"):
+                    w_up[vi] += wt / 255.0
+                elif bn.startswith(("Forearm", "Elbow", "Hand", "Carry", "Index", "Middle", "Ring", "Pinky", "Thumb")):
+                    w_fo[vi] += wt / 255.0
+        out += w_up[:, None] * (upper - pos) + w_fo[:, None] * (fore - pos)
+        names = [k for k in joints if side in k and k.startswith(("Hand", "Carry", "Index", "Middle", "Ring", "Pinky", "Thumb"))]
+        moved = _segment_map(np.array([joints[k] for k in names]), joints[e], joints[h], E2, H2)
+        joints.update(dict(zip(names, moved)))
+        joints[s], joints[e] = S2, E2
+    return out, joints
+
+
 def vertex_normals(verts, faces):
     fn = np.cross(verts[faces[:, 1]] - verts[faces[:, 0]], verts[faces[:, 2]] - verts[faces[:, 0]])
     n = np.zeros_like(verts)
@@ -525,10 +604,22 @@ def write_dds(img: Image.Image, fmt: str, path: Path, srgb: bool):
     path.write_bytes(header + b"".join(levels))
 
 
-def patch_oct(base_info, n_body: int, idx_count: int, bounds, base_name: str, new_name: str):
-    raw = bytearray(base_info["oct"])
+OLD_OCT_VDATA_TAG = bytes.fromhex("1a16a20308")
+
+
+# Numbers live in the oct data section, but older octs (TS_Zurg) keep them earlier: retry past the string table.
+def patch_oct(base_info, n_body: int, idx_count: int, bounds, base_name: str, new_name: str, body_prim: int = 0):
+    raw = base_info["oct"]
     str_sz, _, data_sz = struct.unpack_from("<III", raw, 12)
-    data_start = len(raw) - data_sz
+    try:
+        return _patch_oct(base_info, n_body, idx_count, bounds, base_name, new_name, body_prim, len(raw) - data_sz)
+    except AssertionError:
+        return _patch_oct(base_info, n_body, idx_count, bounds, base_name, new_name, body_prim, str_sz + 64)
+
+
+def _patch_oct(base_info, n_body, idx_count, bounds, base_name, new_name, body_prim, data_start):
+    raw = bytearray(base_info["oct"])
+    str_sz = struct.unpack_from("<I", raw, 12)[0]
     head_part = bytearray(raw[:data_start])
     data_part = bytearray(raw[data_start:])
 
@@ -553,29 +644,44 @@ def patch_oct(base_info, n_body: int, idx_count: int, bounds, base_name: str, ne
     replace_in_data(i24(base_info["ibuf_len"]), i24(new_ibuf_len), "ibuf_len")
 
     for k, prim in enumerate(base_info["prims"]):
-        if k == 0:
+        if k == body_prim:
             new_vals = (0, 0, 0, idx_count)
             new_vdata = i24(2, n_body, 0, 0, 16, 0, s1, 24)
         else:
-            d_idx = k - 1
+            d_idx = k if k < body_prim else k - 1
             v_off_idx = n_body + d_idx * 3
             i_off_bytes = (idx_count + d_idx * 3) * 2
             new_vals = (0, i_off_bytes, v_off_idx, 3)
             new_vdata = i24(2, 3, 0, v_off_idx * 16, 16, 0, s1 + v_off_idx * 24, 24)
 
-        old_i24 = i24(*prim["idata"])
-        if all(0 <= x <= 65535 for x in prim["idata"]) and data_part.find(u16(*prim["idata"])) >= 0:
-            old_u16 = u16(*prim["idata"])
+        old_vdata = i24(*prim["vdata"])
+        pos_v = data_part.find(old_vdata)
+        assert pos_v >= 0 and data_part.count(old_vdata) == 1, f"vdata[{k}] not found exactly once"
+        old_u16 = u16(*prim["idata"]) if all(0 <= x <= 65535 for x in prim["idata"]) else None
+        if data_part[pos_v - 5:pos_v] == OLD_OCT_VDATA_TAG:
+            # Older octs (TS_Zurg) store idata right before vdata with a per-list int width (u8/u16/i24).
+            # A dummy whose values overflow that width draws the degenerate triangle at the head of the ibuf.
+            w = None
+            for width in (1, 2, 3):
+                st = pos_v - 5 - 4 * width
+                if data_part[st - 5] == 0x1a and data_part[st - 4] == 0x13 + width and data_part[st - 3:st] == b"\xa1\x03\x04":
+                    w = width
+            assert w, f"idata[{k}] tag not found before vdata"
+            st = pos_v - 5 - 4 * w
+            if k != body_prim and max(new_vals) >= 1 << (8 * w - (w == 3)):
+                new_vals = (0, 0, 0, 3)
+                new_vdata = i24(2, n_body, 0, 0, 16, 0, s1, 24)
+            assert max(new_vals) < 1 << (8 * w - (w == 3)), f"idata[{k}] {new_vals} does not fit {w} bytes"
+            data_part[st:st + 4 * w] = b"".join(x.to_bytes(w, "little", signed=(w == 3)) for x in new_vals)
+        elif old_u16 and data_part.count(old_u16) == 1:
             pos_i = data_part.find(old_u16)
             data_part[pos_i:pos_i + len(old_u16)] = u16(*new_vals)
         else:
+            old_i24 = i24(*prim["idata"])
+            assert data_part.count(old_i24) == 1, f"idata[{k}] not found exactly once: {prim['idata']}"
             pos_i = data_part.find(old_i24)
-            assert pos_i >= 0, f"missing idata[{k}]"
             data_part[pos_i:pos_i + len(old_i24)] = i24(*new_vals)
 
-        old_vdata = i24(*prim["vdata"])
-        pos_v = data_part.find(old_vdata)
-        assert pos_v >= 0, f"missing vdata[{k}]"
         data_part[pos_v:pos_v + len(old_vdata)] = new_vdata
 
     bmin, bmax, center, radius = bounds
@@ -593,17 +699,20 @@ def patch_oct(base_info, n_body: int, idx_count: int, bounds, base_name: str, ne
     return bytes(head_part) + bytes(data_part)
 
 
+# Points the body material (index body_prim, textures body_tex in TEXB) at the TS3 atlas and gives it a unique GUID/hash.
 def patch_mtb(base_info, spec):
     data = bytearray(base_info["mtb"])
-    old_diff = data[36:44]
-    old_norm = data[48:56]
+    body = spec.get("body_prim", 0)
+    t_diff, t_norm = spec.get("body_tex", (0, 1))
+    old_diff = data[36 + 12 * t_diff:44 + 12 * t_diff]
+    old_norm = data[36 + 12 * t_norm:44 + 12 * t_norm]
     new_diff = bytes.fromhex(spec["diff_hash"])
     new_norm = bytes.fromhex(spec["norm_hash"])
     data = bytearray(bytes(data).replace(old_diff, new_diff).replace(old_norm, new_norm))
 
     guids = list(re.finditer(rb"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", data))
     assert guids, "no GUID in mtb"
-    g0 = guids[0]
+    g0 = guids[body]
     data[g0.start():g0.end()] = spec["mat_guid"]
 
     # Patch materialHashes[0] in MATP so characters cloned from the same base (or vanilla)
@@ -614,7 +723,7 @@ def patch_mtb(base_info, spec):
     pos = guids[-1].end() + 1  # past trailing NUL of last GUID
     pos = (pos + 1) & ~1       # align 2 for uint16 shaderIds[num_mats]
     pos_hashes = (pos + num_mats * 2 + 3) & ~3  # align 4 for uint32 materialHashes[num_mats]
-    data[pos_hashes:pos_hashes + 4] = spec["mat_hash"]
+    data[pos_hashes + 4 * body:pos_hashes + 4 * body + 4] = spec["mat_hash"]
     return bytes(data)
 
 
@@ -635,6 +744,44 @@ def build_b3_texture_zip(tex_out: Path) -> Path:
     return archive
 
 
+CREATOR = DIM2 / "DisneyInfinityCreator"
+ICONS = BUILD / "icons"
+
+
+# Virtual Reader pictures (figure, small, glowing silhouette) from build/icons/<char>_body.png (tools/render_icons.py).
+# The game reads ui/virtualreadercharacters only from its archive, so the mod ships a rebuilt copy: vanilla entries
+# byte for byte + ours, built and read back by DisneyInfinityCreator's shared._build (same layout as its own icons).
+def build_reader_icons():
+    sys.path.insert(0, str(CREATOR))
+    from src.core import icon, shared
+
+    files = {}
+    stage = BUILD / "icons_stage"
+    shutil.rmtree(stage, ignore_errors=True)
+    for spec in CHARACTERS:
+        lname = spec["name"].lower()
+        body = ICONS / f"{lname}_body.png"
+        if not body.exists():
+            print(f"  no icon render for {lname} (run tools/render_icons.py)")
+            continue
+        figure = icon.figure_icon(Image.open(body))
+        pictures = {lname: figure, f"{lname}_sm": figure.resize((icon.SMALL_SIZE,) * 2, Image.LANCZOS),
+                    f"{lname}_s": icon.silhouette_icon(figure)}
+        for name, pic in pictures.items():
+            tex = icon.texture_hash(name)
+            (stage / "textures").mkdir(parents=True, exist_ok=True)
+            (stage / f"{name}.mtb").write_bytes(icon.ui_bundle(name, tex))
+            (stage / "textures" / f"{tex}.tbody").write_bytes(icon.dds_single(pic))
+            files[f"virtualreadercharacters/{name}.mtb"] = stage / f"{name}.mtb"
+            files[f"virtualreadercharacters/textures/{tex}.tbody"] = stage / "textures" / f"{tex}.tbody"
+    if not files:
+        return
+    vanilla = DI3_GAME / "assets" / "ui" / "virtualreadercharacters" / "virtualreadercharacters.zip"
+    out = MOD_OUT / "ui" / "virtualreadercharacters" / "virtualreadercharacters.zip"
+    n = shared._build(vanilla, "virtualreadercharacters", files, out, BUILD / "icons_work", print)
+    print(f"  virtualreadercharacters.zip: {n} entries ({len(files)} ours)")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.parse_args()
@@ -651,11 +798,17 @@ def main():
         name = spec["name"]
         base = spec["base"]
         lname, lbase = name.lower(), base.lower()
-        assert len(name) == len(base), (name, base)
-        print(f"\n=== Building {name} (from TS3 {spec['ts3_dir']} -> DI3 {base}) ===")
+        # model_base gives the skeleton/oct/mtb/bent; base keeps the dnax, anim overrides and actor data
+        model = spec.get("model_base", base)
+        lmodel = model.lower()
+        assert len(name) == len(base) == len(model), (name, base, model)
+        print(f"\n=== Building {name} (from TS3 {spec['ts3_dir']} -> DI3 {model}, actor {base}) ===")
 
         ts_pos, ts_nrm, ts_uv, ts_faces, ts_bnames, ts_bw, ts3_bone_pos, atlas = load_ts3_character(spec)
-        base_info = load_di3_base(base)
+        base_info = load_di3_base(model)
+        if model != base:
+            actor_info = load_di3_base(base)
+            base_info["dnax"], base_info["anim"], base_info["bent"] = actor_info["dnax"], actor_info["anim"], actor_info["bent"]
 
         bone_names = base_info["bone_names"]
         bone_world = base_info["bone_world"]
@@ -679,7 +832,10 @@ def main():
         jposed, _ = rotate_arms_to_apose(jp, np.zeros_like(jp), [[k] * 4 for k in jn],
                                          np.tile([255, 0, 0, 0], (len(jn), 1)), ts3_bone_pos, di3_pos, scale)
         jposed[:, 1] -= floor
-        bone_map = ts3_bone_map(ts_bnames, dict(zip(jn, jposed)), di3_pos, bone_names)
+        joints = dict(zip(jn, jposed))
+        if spec.get("retarget_arms"):
+            baked, joints = retarget_arms(baked, ts_bnames, ts_bw, joints, di3_pos)
+        bone_map = ts3_bone_map(ts_bnames, joints, di3_pos, bone_names)
         bnormals /= np.maximum(np.linalg.norm(bnormals, axis=1, keepdims=True), 1e-12)
 
         # Check winding sign against DI3 base
@@ -688,6 +844,10 @@ def main():
         vfaces = ts_faces[:, ::-1] if (base_info["winding"] * ts_sign < 0) else ts_faces
         if base_info["winding"] * ts_sign < 0:
             bnormals = -bnormals
+
+        edit = load_hand_edit(lname, len(baked), bone_names)
+        if edit is not None:
+            baked = edit["pos"].astype(float)
 
         # Recompute smooth vertex normals & tangents on the posed mesh, guarding against zero-area faces
         recomp = vertex_normals(baked, vfaces) * base_info["winding"]
@@ -707,6 +867,9 @@ def main():
                     bone_cache[bn] = bone_names.index(bone_map[bn])
                 idx[vi, k] = bone_cache[bn]
         wq = ts_bw.astype(np.uint8)
+        if edit is not None:
+            idx, wq = edit["bidx"].astype(np.uint8), edit["bw"].astype(np.uint8)
+            print(f"  hand edit applied: edits/{lname}.npz")
 
         n_body = len(baked)
         n_dummy_tris = len(base_info["prims"]) - 1
@@ -731,7 +894,9 @@ def main():
         vbuf = s0.tobytes() + s1.tobytes()
 
         dummy_indices = np.arange(n_body, n_body + n_dummy_verts, dtype="<u2")
-        indices = np.r_[vfaces.reshape(-1), dummy_indices].astype("<u2")
+        # Leading degenerate triangle: a dummy prim that cannot address its own triangle draws this one (see patch_oct)
+        body_indices = np.r_[[0, 0, 0], vfaces.reshape(-1)]
+        indices = np.r_[body_indices, dummy_indices].astype("<u2")
         assert n_body + n_dummy_verts < 65536
 
         bmin, bmax = baked.min(0), baked.max(0)
@@ -742,16 +907,22 @@ def main():
         char_dir.mkdir(parents=True, exist_ok=True)
         (char_dir / f"{lname}_0.vbuf").write_bytes(vbuf)
         (char_dir / f"{lname}_0.ibuf").write_bytes(indices.tobytes())
-        (char_dir / f"{lname}.oct").write_bytes(patch_oct(base_info, n_body, vfaces.size, (bmin, bmax, center, radius), base, name))
+        (char_dir / f"{lname}.oct").write_bytes(patch_oct(base_info, n_body, body_indices.size, (bmin, bmax, center, radius), model, name, spec.get("body_prim", 0)))
         (char_dir / f"{lname}.mtb").write_bytes(patch_mtb(base_info, spec))
         (char_dir / f"{lname}.animtreeoverrides").write_bytes(base_info["anim"])
 
-        bent = base_info["bent"].replace(f"characters/{lbase}/{lbase}.oct\0".encode(), f"characters/{lname}/{lname}.oct\0".encode())
+        old_oct = f"characters/{lbase}/{lbase}.oct\0".encode()
+        assert old_oct in base_info["bent"], f"{old_oct} missing from {base}.bent"
+        bent = base_info["bent"].replace(old_oct, f"characters/{lname}/{lname}.oct\0".encode())
         (char_dir / f"{lname}.bent").write_bytes(bent)
 
         model_path = f"characters/{name}/{name}".encode()
         dnax = re.sub(rb"characters/" + lbase.encode() + rb"/" + lbase.encode() + rb"(?=\x00)", model_path, base_info["dnax"], flags=re.IGNORECASE)
         dnax = re.sub(rb"characters/" + lbase.encode() + rb"/" + lbase.encode() + rb"\.animtreeoverrides(?=\x00)", model_path + b".animtreeoverrides", dnax, flags=re.IGNORECASE)
+        # Same-length constant swaps in the Lua bytecode (lengths are stored, so sizes must match)
+        for old, new in spec.get("dnax_replace", {}).items():
+            assert len(old) == len(new) and dnax.count(old) == 1, (name, old, new)
+            dnax = dnax.replace(old, new)
         (char_dir / f"{lname}.dnax").write_bytes(dnax)
 
         write_dds(atlas, "DXT1", tex_out / f"{spec['diff_hash']}.tbody", srgb=True)
@@ -824,6 +995,8 @@ def main():
             "end",
         ])
     (skill_dir / "DataMap.patch").write_text("\n".join(dm_lines) + "\n", encoding="utf-8")
+
+    build_reader_icons()
 
     shutil.copy2(MOD_ROOT / "mod.json", MOD_OUT / "mod.json")
     shutil.copy2(MOD_ROOT / "ts3_characters.lua", MOD_OUT / "ts3_characters.lua")
