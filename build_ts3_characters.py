@@ -774,12 +774,33 @@ def build_reader_icons():
             (stage / "textures" / f"{tex}.tbody").write_bytes(icon.dds_single(pic))
             files[f"virtualreadercharacters/{name}.mtb"] = stage / f"{name}.mtb"
             files[f"virtualreadercharacters/textures/{tex}.tbody"] = stage / "textures" / f"{tex}.tbody"
-    if not files:
-        return
-    vanilla = DI3_GAME / "assets" / "ui" / "virtualreadercharacters" / "virtualreadercharacters.zip"
-    out = MOD_OUT / "ui" / "virtualreadercharacters" / "virtualreadercharacters.zip"
-    n = shared._build(vanilla, "virtualreadercharacters", files, out, BUILD / "icons_work", print)
-    print(f"  virtualreadercharacters.zip: {n} entries ({len(files)} ours)")
+    # Character grid tile av_<icon suffix> (256 px bust) and HUD portrait hud_playericons_<name> (128 px head):
+    # the grid derives its tile from the row's Icon (HUD_PlayerIcons_Buzz -> av_buzz), both live in icons.zip.
+    grid = {}
+    for spec in CHARACTERS:
+        lname = spec["name"].lower()
+        bust, head = ICONS / f"{lname}_bust.png", ICONS / f"{lname}_head.png"
+        if not (bust.exists() and head.exists()):
+            print(f"  no portrait render for {lname} (run tools/render_portraits.py)")
+            continue
+        tile = Image.open(bust).convert("RGBA").resize((256, 256), Image.LANCZOS)
+        framed = icon._glow(tile.getchannel("A"), 3)
+        framed.alpha_composite(tile)
+        for name, pic in ((f"av_{lname}", framed), (icon.hud_name(spec["name"]).lower(), icon.hud_icon(Image.open(head)))):
+            tex = icon.texture_hash(name)
+            (stage / "textures").mkdir(parents=True, exist_ok=True)
+            (stage / f"{name}.mtb").write_bytes(icon.ui_bundle(name, tex))
+            (stage / "textures" / f"{tex}.tbody").write_bytes(icon.dds_single(pic))
+            grid[f"icons/{name}.mtb"] = stage / f"{name}.mtb"
+            grid[f"icons/textures/{tex}.tbody"] = stage / "textures" / f"{tex}.tbody"
+
+    for stem, ours in (("virtualreadercharacters", files), ("icons", grid)):
+        if not ours:
+            continue
+        vanilla = DI3_GAME / "assets" / "ui" / stem / f"{stem}.zip"
+        out = MOD_OUT / "ui" / stem / f"{stem}.zip"
+        n = shared._build(vanilla, stem, ours, out, BUILD / "icons_work", print)
+        print(f"  {stem}.zip: {n} entries ({len(ours)} ours)")
 
 
 def main():
@@ -933,6 +954,7 @@ def main():
             "Crabe.VirtualReader.exposeCharacter({\n"
             f'    Name = "{name}",\n'
             f'    ProgressionTree = "{spec["prog_tree"]}",\n'
+            f'    Icon = "HUD_PlayerIcons_{name}",\n'
             "})\n", encoding="utf-8")
 
         actor_patches.append((spec["actor_key"], lname, name, spec["parms_extra"]))
