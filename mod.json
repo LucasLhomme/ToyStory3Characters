@@ -1,0 +1,8 @@
+{
+  "name": "Toy Story 3 Characters (Woody, Jessie, Buzz, Zurg)",
+  "version": "1.0.0",
+  "minLoaderVersion": "0.2.0",
+  "author": "Crabe",
+  "description": "Imports Woody, Jessie, Buzz Lightyear, and Emperor Zurg from Toy Story 3 as playable characters in Disney Infinity 3.0.",
+  "entry": "ts3_characters.lua"
+}
