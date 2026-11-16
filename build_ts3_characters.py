@@ -1,10 +1,9 @@
 """build_ts3_characters.py - Import Woody, Jessie, Buzz, and Zurg from Toy Story 3 into Disney Infinity 3.0.
 
-Builds a standalone CrabeLoader mod with 4 new playable clone actors:
-  - T3_Woody  (cloned from TS_Woody)
-  - T3_Jessie (cloned from TS_Jessie)
-  - T3_Buzz   (cloned from TS_Buzz)
-  - T3_Zurg   (cloned from TS_Buzz)
+Uses TS3's authentic artist-authored SkinRemap bone weights and BoneToModelMatrix
+skeleton directly (no guessed bounding-box heuristics or bone-heat artifacts),
+rotates only the arms from TS3's T-pose into DI3's A-pose via volume-preserving
+axis-angle blending, and maps TS3 bones 1-to-1 onto the DI3 base skeleton.
 """
 import argparse
 import io
@@ -20,8 +19,8 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw
-from scipy.spatial import cKDTree
+from PIL import Image
+from scipy.spatial.transform import Rotation
 
 MOD_ROOT = Path(__file__).resolve().parent
 DIM2 = MOD_ROOT.parent
@@ -30,14 +29,6 @@ QUICKBMS = TOOLS / "QuickBMS" / "quickbms.exe"
 BMS_SCRIPT = TOOLS / "QuickBMS" / "disney_infinity_new.bms"
 REENCRYPTER = TOOLS / ".ZIP Reencrypter" / "offsetting.exe"
 ZIP_KEY = "681BBEEA63160188F9B7945104A51499"
-BLENDER = next(
-    (p for p in (
-        Path(r"C:\Program Files\Blender Foundation\Blender 4.5\blender.exe"),
-        Path(r"C:\Program Files\Blender Foundation\Blender 5.2\blender.exe"),
-    ) if p.exists()),
-    Path("blender"),
-)
-HEAT_SCRIPT = TOOLS / "sora_work" / "pipeline" / "blender_heat_weights.py"
 C2DITOOLS_SRC = TOOLS / "Cars2TheVideoGameModding" / "src"
 
 TS3_GAME = Path(r"D:\Jeu\Crack\Toy Story 3 Complete Edition")
@@ -45,22 +36,19 @@ DI3_GAME = Path(r"D:\SteamLibrary\steamapps\common\Disney Infinity 3.0 Gold Edit
 
 BUILD = MOD_ROOT / "build"
 RAW = BUILD / "raw"
-PREVIEWS = BUILD / "previews"
 MOD_OUT = BUILD / "mod"
 
 ATLAS_SIZE = 1024
 ATLAS_PAD = 8
 FLAT_NORMAL_RGBA = (255, 127, 140, 127)
-SIDES = (("Left", 1.0), ("Right", -1.0))
 
-# Character specs: (new_name, base_name, ts3_folder, ts3_zip, skip_mats, mat_guid, mat_hash, diff_hash, norm_hash)
 CHARACTERS = [
     {
         "name": "T3_Woody",
         "base": "TS_Woody",
         "ts3_dir": "woody",
         "ts3_zip": "woody.zip",
-        "skip_mats": set(),
+        "skip_mats": {"EyeLid_RightUpper1", "EyeLid_RightLower1", "EyeLid_LeftUpper1", "EyeLid_LeftLower1"},
         "mat_guid": b"b3000001-0001-4000-8000-000000000001",
         "mat_hash": bytes.fromhex("b3000001"),
         "diff_hash": "b300000000000001",
@@ -73,7 +61,7 @@ CHARACTERS = [
         "base": "TS_Jessie",
         "ts3_dir": "jessie",
         "ts3_zip": "jessie.zip",
-        "skip_mats": set(),
+        "skip_mats": {"_EyeLid_Upper_RIGHT", "_EyeLid_Lower_RIGHT", "_EyeLid_Upper_LEFT", "_EyeLid_Lower_LEFT"},
         "mat_guid": b"b3000002-0002-4000-8000-000000000002",
         "mat_hash": bytes.fromhex("b3000002"),
         "diff_hash": "b300000000000003",
@@ -99,7 +87,7 @@ CHARACTERS = [
         "base": "TS_Buzz",
         "ts3_dir": "zurgavatar",
         "ts3_zip": "zurgavatar.zip",
-        "skip_mats": {"Smokey_plastic"},
+        "skip_mats": {"Smokey_plastic", "Zurg_gun_mat", "Yellow_ball"},
         "mat_guid": b"b3000004-0004-4000-8000-000000000004",
         "mat_hash": bytes.fromhex("b3000004"),
         "diff_hash": "b300000000000007",
@@ -127,8 +115,65 @@ def quickbms_extract(archive: Path, pattern: str, out: Path):
                    check=True, capture_output=True)
 
 
+def map_ts3_bone_to_di3(ts3_bname: str, di3_bones: list[str]) -> str:
+    """Maps a TS3 bone name to the closest matching bone name in the DI3 skeleton."""
+    def pick(*cands):
+        for c in cands:
+            if c in di3_bones:
+                return c
+        return "Hips"
+
+    # Side detection (TS3 uses both FooLeft and FooLeft1 / FooLeftDown / FooUpLeft)
+    side = None
+    if "Left" in ts3_bname:
+        side = "Left"
+    elif "Right" in ts3_bname:
+        side = "Right"
+
+    # Direct torso / head / rigid attachments
+    if ts3_bname in ("Body", "Hips", "Main", "Origin", "Holster", "LassoAttach", "PullRing", "Knee", "Foot"):
+        return pick("Hips")
+    if ts3_bname == "Spine1":
+        return pick("Spine1", "Hips")
+    if ts3_bname == "Spine2":
+        return pick("Spine2", "Spine1", "Hips")
+    if ts3_bname in ("Spine3", "BackPackButton", "PackReloader", "CapeAdjust", "Cape1", "Cape2", "Cape3", "Cape4") or ts3_bname.startswith(("Wing", "Dome", "Flame", "Sternum", "Tube")):
+        return pick("Spine3", "Spine2", "Spine1", "Hips")
+    if ts3_bname == "Neck":
+        return pick("Neck", "Spine3")
+    if ts3_bname in ("Head", "Hat", "Jaw", "UpperLip", "LowerLip", "MiddleBrow", "MidddleBrow", "BrowMiddle") or ts3_bname.lower().startswith(("hair", "eye", "lid", "lip", "brow")):
+        return pick("Head", "Neck")
+
+    if side:
+        if ts3_bname.startswith("Clavicle"):
+            return pick(f"Clavicle_{side}", "Spine3")
+        if ts3_bname.startswith("Bicep"):
+            return pick(f"Shoulder_{side}")
+        if ts3_bname.startswith(("Forearm", "Elbow")):
+            return pick(f"Elbow_{side}")
+        if ts3_bname.startswith(("Hand", "Carry")):
+            return pick(f"Hand_{side}")
+        if ts3_bname.startswith(("Index", "Middle", "Ring", "Pinky", "Thumb")):
+            for fbase in ("Index1", "Middle1", "Thumb1"):
+                if ts3_bname.startswith(fbase[:4]) and f"{fbase}_{side}" in di3_bones:
+                    return f"{fbase}_{side}"
+            return pick(f"Hand_{side}")
+        if ts3_bname.startswith(("Leg", "Thigh")):
+            return pick(f"Thigh_{side}")
+        if ts3_bname.startswith("Calf"):
+            return pick(f"Knee_{side}", f"Knee_Break_{side}")
+        if ts3_bname.startswith("Foot"):
+            return pick(f"Ankle_{side}", f"Ankle_Break_{side}")
+        if ts3_bname.startswith("Toe"):
+            return pick(f"Toes_{side}", f"Ball_{side}", f"Toes_Break_{side}", f"Ankle_{side}", f"Ankle_Break_{side}")
+
+    if ts3_bname in ("Laser", "LightningRod", "GunHandle", "Revolver"):
+        return pick("Hand_Right")
+    return pick("Hips")
+
+
 def load_ts3_character(spec):
-    """Extracts TS3 character zip, decodes .oct, and returns (positions, normals, uvs, faces, atlas_img)."""
+    """Extracts TS3 character zip, decodes .oct, and reads authentic geometry + SkinRemap weights."""
     ts3_name = spec["ts3_dir"]
     work = RAW / "ts3" / ts3_name
     work.mkdir(parents=True, exist_ok=True)
@@ -144,6 +189,21 @@ def load_ts3_character(spec):
     vbuf = (work / f"{ts3_name}_0.vbuf").read_bytes()
     ibuf = (work / f"{ts3_name}_0.ibuf").read_bytes()
 
+    # Build BoneID -> (NodeName, BoneToModelPosition)
+    ts3_bones_by_id = {}
+    ts3_bone_pos = {}
+    for node in root.findall("./SceneTreeNodePool/*"):
+        bid = node.findtext("BoneID")
+        if bid is not None:
+            bname = node.findtext("NodeName")
+            ts3_bones_by_id[int(bid)] = bname
+            m_el = node.find("BoneToModelMatrix")
+            if m_el is not None:
+                vals = [float(e.text) for e in m_el.findall("entry")]
+                if len(vals) == 16:
+                    ts3_bone_pos[bname] = np.array(vals).reshape(4, 4)[3, :3]
+
+    scs = root.findall("./SceneComponentPool/*")
     texs = [t.findtext("Name") for t in root.findall("./TexturePool/*")]
     mats = []
     for m in root.findall("./MaterialPool/*"):
@@ -153,13 +213,13 @@ def load_ts3_character(spec):
     vstreams = root.findall("./VertexStreamPool/*")
     istreams = root.findall("./IndexStreamPool/*")
 
-    # Collect primitives
     prims = []
     used_tex_names = []
     for el in root.iter():
         mr = el.find("MaterialReference")
         vsr = el.find("VertexStreamReferences")
         isr = el.find("IndexStreamReference")
+        scr = el.find("SceneComponentReferences")
         if mr is None or vsr is None or isr is None:
             continue
         mat_id = int(mr.text)
@@ -171,7 +231,11 @@ def load_ts3_character(spec):
             continue
         vs_ids = [int(e.text) for e in vsr.findall("entry")]
         is_id = int(isr.text)
-        prims.append((vs_ids, is_id, tex_name))
+        remap = []
+        if scr is not None:
+            sc_id = int(scr.find("entry").text)
+            remap = [int(x.text) for x in scs[sc_id].findall("./RemapData/entry")]
+        prims.append((vs_ids, is_id, tex_name, remap))
         if tex_name not in used_tex_names:
             used_tex_names.append(tex_name)
 
@@ -193,31 +257,29 @@ def load_ts3_character(spec):
         atlas.paste(Image.fromarray(padded), (rx, ry))
 
     all_pos, all_nrm, all_uv, all_faces = [], [], [], []
+    all_bnames, all_bweights = [], []  # per-vertex 4 bone names + 4 uint8 weights
     v_base = 0
-    for vs_ids, is_id, tex_name in prims:
+    for vs_ids, is_id, tex_name, remap in prims:
         vs0 = vstreams[vs_ids[0]]
         nv = int(vs0.findtext("Length"))
         w0 = int(vs0.findtext("Width"))
         off0 = int(vs0.findtext("VertexBufferOffset") or 0)
         raw0 = np.frombuffer(vbuf[off0:off0 + nv * w0], np.uint8).reshape(nv, w0)
         pos = raw0[:, :12].copy().view("<f4").reshape(nv, 3)
+        bidx_local = raw0[:, 12:16]
+        bweights = raw0[:, 16:20]
         uv_raw = raw0[:, 20:24].copy().view("<f2").reshape(nv, 2).astype(float)
-        # Handle wrapped UVs cleanly
         uv = np.where((uv_raw < -0.01) | (uv_raw > 1.01), np.mod(uv_raw, 1.0), np.clip(uv_raw, 0.0, 1.0))
         rx, ry, rw, rh = rects[tex_name]
         au = (rx + ATLAS_PAD + uv[:, 0] * (rw - 2 * ATLAS_PAD)) / ATLAS_SIZE
         av = (ry + ATLAS_PAD + uv[:, 1] * (rh - 2 * ATLAS_PAD)) / ATLAS_SIZE
 
-        # Normal from VS[1] if present (Normal at offset 8 as float16[4])
         if len(vs_ids) > 1:
             vs1 = vstreams[vs_ids[1]]
             w1 = int(vs1.findtext("Width"))
             off1 = int(vs1.findtext("VertexBufferOffset") or 0)
             raw1 = np.frombuffer(vbuf[off1:off1 + nv * w1], np.uint8).reshape(nv, w1)
-            if w1 == 24:
-                nrm = raw1[:, 8:14].copy().view("<f2").reshape(nv, 3).astype(float)
-            else:
-                nrm = raw1[:, :6].copy().view("<f2").reshape(nv, 3).astype(float)
+            nrm = (raw1[:, 8:14] if w1 == 24 else raw1[:, :6]).copy().view("<f2").reshape(nv, 3).astype(float)
         else:
             nrm = np.tile([0.0, 0.0, 1.0], (nv, 1))
 
@@ -226,16 +288,35 @@ def load_ts3_character(spec):
         ioff = int(is_el.findtext("IndexBufferOffset") or 0)
         tris = np.frombuffer(ibuf[ioff:ioff + ni * 2], "<u2").reshape(-1, 3).astype(int)
 
-        # Compact only referenced vertices in this primitive
         used_v, inv = np.unique(tris, return_inverse=True)
         tris_local = inv.reshape(-1, 3) + v_base
+
+        # Resolve local bone indices via SkinRemap -> BoneID -> NodeName
+        remap_arr = np.array(remap, dtype=int) if remap else np.arange(256)
+        v_bidx = bidx_local[used_v]
+        v_bw = bweights[used_v]
+        v_bnames = []
+        for row_idx in v_bidx:
+            v_bnames.append([ts3_bones_by_id.get(int(remap_arr[int(li)]), "Hips") if int(li) < len(remap_arr) else "Hips" for li in row_idx])
+
         all_pos.append(pos[used_v])
         all_nrm.append(nrm[used_v])
         all_uv.append(np.stack([au[used_v], av[used_v]], 1))
         all_faces.append(tris_local)
+        all_bnames.extend(v_bnames)
+        all_bweights.append(v_bw)
         v_base += len(used_v)
 
-    return np.vstack(all_pos), np.vstack(all_nrm), np.vstack(all_uv), np.vstack(all_faces), atlas
+    return (
+        np.vstack(all_pos),
+        np.vstack(all_nrm),
+        np.vstack(all_uv),
+        np.vstack(all_faces),
+        all_bnames,
+        np.vstack(all_bweights),
+        ts3_bone_pos,
+        atlas,
+    )
 
 
 def load_di3_base(base_name: str):
@@ -278,7 +359,6 @@ def load_di3_base(base_name: str):
         })
     bbox = [float(e.text) for e in root.find(".//BoundingBox")]
 
-    # Compute winding sign of Prim[0]
     vbuf = vbuf_file.read_bytes()
     ibuf = ibuf_file.read_bytes()
     p0 = prims[0]
@@ -306,208 +386,46 @@ def load_di3_base(base_name: str):
     }
 
 
-def pick_bone(base_pos: dict[str, np.ndarray], *candidates: str) -> str:
-    for c in candidates:
-        if c in base_pos:
-            return c
-    raise KeyError(candidates)
+def rotate_arms_to_apose(pos: np.ndarray, nrm: np.ndarray, ts_bnames: list[list[str]], ts_bw: np.ndarray, ts3_bone_pos: dict[str, np.ndarray], di3_pos: dict[str, np.ndarray], scale: float):
+    """Rotates ONLY vertices weighted to TS3 arm bones from T-pose into DI3's A-pose.
 
+    Uses volume-preserving axis-angle interpolation around each Bicep joint so
+    torso, wings, chestplates, capes, head, and legs remain 100% undeformed.
+    """
+    out_pos = pos.copy()
+    out_nrm = nrm.copy()
 
-def make_tpose_anchors(positions: np.ndarray, base_pos: dict[str, np.ndarray], scale: float):
-    """Builds T-pose joint anchors directly from the TS3 mesh geometry."""
-    p = positions * scale
-    bmin, bmax = p.min(0), p.max(0)
-    h = bmax[1] - bmin[1]
+    for side in ("Left", "Right"):
+        bicep_key = f"Bicep{side}"
+        hand_key = f"Hand{side}"
+        if bicep_key not in ts3_bone_pos or hand_key not in ts3_bone_pos:
+            continue
+        pivot = ts3_bone_pos[bicep_key] * scale
+        ts_vec = (ts3_bone_pos[hand_key] - ts3_bone_pos[bicep_key]) * scale
+        di_vec = di3_pos[f"Hand_{side}"] - di3_pos[f"Shoulder_{side}"]
+        ts_u = ts_vec / np.linalg.norm(ts_vec)
+        di_u = di_vec / np.linalg.norm(di_vec)
+        rot_full, _ = Rotation.align_vectors([di_u], [ts_u])
+        rotvec = rot_full.as_rotvec()
 
-    # Measure arm Y height from vertices around x in [0.45, 0.85]
-    arm_pts = p[(np.abs(p[:, 0]) > 0.45 * scale) & (np.abs(p[:, 0]) < 0.85 * scale)]
-    arm_y = float(np.median(arm_pts[:, 1])) if len(arm_pts) else h * 0.72
-    arm_z = float(np.median(arm_pts[:, 2])) if len(arm_pts) else 0.0
+        # Sum vertex weight belonging to this side's arm (Bicep, Forearm, Elbow, Hand, fingers)
+        arm_prefixes = ("Bicep", "Forearm", "Elbow", "Hand", "Index", "Middle", "Ring", "Pinky", "Thumb", "Carry")
+        w_arm = np.zeros(len(pos), dtype=float)
+        for vi, (bn_row, bw_row) in enumerate(zip(ts_bnames, ts_bw)):
+            s = 0.0
+            for bn, bw in zip(bn_row, bw_row):
+                if bw > 0 and (side in bn) and bn.startswith(arm_prefixes):
+                    s += float(bw) / 255.0
+            w_arm[vi] = min(s, 1.0)
 
-    # Measure leg X/Z around y in [0.15*h, 0.40*h]
-    leg_pts = p[(p[:, 1] > 0.15 * h) & (p[:, 1] < 0.40 * h) & (np.abs(p[:, 0]) > 0.02)]
-    leg_x = float(np.median(np.abs(leg_pts[:, 0]))) if len(leg_pts) else 0.10 * scale
-    leg_z = float(np.median(leg_pts[:, 2])) if len(leg_pts) else 0.0
+        mask = w_arm > 1e-4
+        if np.any(mask):
+            # Apply per-vertex axis-angle rotation around Bicep pivot
+            rots = Rotation.from_rotvec(rotvec[None, :] * w_arm[mask, None])
+            out_pos[mask] = rots.apply(out_pos[mask] - pivot) + pivot
+            out_nrm[mask] = rots.apply(out_nrm[mask])
 
-    # Measure hand tip X (ignoring Zurg's extended gun on -X by using +X side)
-    pos_x_max = float(p[:, 0].max())
-    hand_tip_x = max(pos_x_max * 0.95, 0.55 * scale)
-    shoulder_x = max(leg_x * 1.4, 0.16 * scale)
-    elbow_x = (shoulder_x + hand_tip_x * 0.72) * 0.5
-    hand_x = hand_tip_x * 0.72
-
-    # Crotch / hips height
-    hips_y = h * 0.48
-    neck_y = min(arm_y + 0.06 * scale, h * 0.80)
-    head_y = h * 0.85
-    ankle_y = float(base_pos[pick_bone(base_pos, "Ankle_Left", "Ankle_Break_Left")][1])
-
-    a = {
-        "Hips": np.array([0.0, hips_y, leg_z]),
-        "HipsLow": np.array([0.0, hips_y * 0.85, leg_z]),
-        "Neck": np.array([0.0, neck_y, arm_z]),
-        "Head": np.array([0.0, head_y, arm_z]),
-        "HeadTop": np.array([0.0, bmax[1] + 0.05, arm_z]),
-    }
-    lh, ln = base_pos["Hips"][1], base_pos["Neck"][1]
-    for sp in ("Spine2", "Spine3"):
-        t = (base_pos[sp][1] - lh) / (ln - lh)
-        a[sp] = a["Hips"] + t * (a["Neck"] - a["Hips"])
-
-    for side, sx in SIDES:
-        a[f"Clavicle_{side}"] = a["Spine3"] + np.array([sx * 0.04 * scale, 0.02 * scale, 0.0])
-        a[f"ClavicleHeat_{side}"] = a["Spine3"] + np.array([sx * 0.03 * scale, 0.02 * scale, 0.0])
-        a[f"Shoulder_{side}"] = np.array([sx * shoulder_x, arm_y, arm_z])
-        a[f"Elbow_{side}"] = np.array([sx * elbow_x, arm_y, arm_z])
-        a[f"Hand_{side}"] = np.array([sx * hand_x, arm_y, arm_z])
-        a[f"HandTip_{side}"] = np.array([sx * hand_tip_x, arm_y, arm_z])
-        a[f"Thigh_{side}"] = np.array([sx * leg_x, hips_y * 0.94, leg_z])
-        a[f"Knee_{side}"] = np.array([sx * leg_x, hips_y * 0.52, leg_z])
-        a[f"AnkleTrue_{side}"] = np.array([sx * leg_x, max(ankle_y, 0.12), leg_z])
-        a[f"Ankle_{side}"] = np.array([sx * leg_x, ankle_y, leg_z])
-        a[f"Ball_{side}"] = np.array([sx * leg_x, 0.03, leg_z + 0.10])
-        a[f"ToeTip_{side}"] = np.array([sx * leg_x, 0.03, leg_z + 0.22])
-    return a
-
-
-def heat_bones():
-    bones = [("Hips", "HipsLow", "Spine2", ""), ("Spine2", "Spine2", "Spine3", "Hips"),
-             ("Spine3", "Spine3", "Neck", "Spine2"), ("Neck", "Neck", "Head", "Spine3"),
-             ("Head", "Head", "HeadTop", "Neck")]
-    for side, _ in SIDES:
-        bones += [(f"Clavicle_{side}", f"ClavicleHeat_{side}", f"Shoulder_{side}", "Spine3"),
-                  (f"Shoulder_{side}", f"Shoulder_{side}", f"Elbow_{side}", f"Clavicle_{side}"),
-                  (f"Elbow_{side}", f"Elbow_{side}", f"Hand_{side}", f"Shoulder_{side}"),
-                  (f"Hand_{side}", f"Hand_{side}", f"HandTip_{side}", f"Elbow_{side}"),
-                  (f"Thigh_{side}", f"Thigh_{side}", f"Knee_{side}", "Hips"),
-                  (f"Knee_{side}", f"Knee_{side}", f"AnkleTrue_{side}", f"Thigh_{side}"),
-                  (f"Ankle_{side}", f"AnkleTrue_{side}", f"Ball_{side}", f"Knee_{side}"),
-                  (f"Ball_{side}", f"Ball_{side}", f"ToeTip_{side}", f"Ankle_{side}")]
-    return bones
-
-
-def rotation_between(a, b):
-    a = a / np.linalg.norm(a)
-    b = b / np.linalg.norm(b)
-    v = np.cross(a, b)
-    c = float(np.dot(a, b))
-    if c < -0.9999:
-        return np.diag([1.0, -1.0, -1.0])
-    vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
-    return np.eye(3) + vx + vx @ vx / (1.0 + c)
-
-
-def segment_transform(js, cs, jl, cl, axial=True, thicken=False):
-    ds, dl = cs - js, cl - jl
-    rot_row = rotation_between(ds, dl).T
-    k = float(np.clip(np.linalg.norm(dl) / max(np.linalg.norm(ds), 1e-6), 0.6, 1.7)) if axial else 1.0
-    r = float(np.sqrt(k)) if thicken and k > 1.0 else 1.0
-    u = ds / max(np.linalg.norm(ds), 1e-6)
-    m = (r * np.eye(3) + (k - r) * np.outer(u, u)) @ rot_row
-    return m, jl - js @ m
-
-
-def bake_transforms(anchors, base_pos):
-    specs = {"Hips": ("Hips", "Spine2", "Hips", "Spine2", False),
-             "Spine2": ("Spine2", "Spine3", "Spine2", "Spine3", True),
-             "Spine3": ("Spine3", "Neck", "Spine3", "Neck", True),
-             "Neck": ("Neck", "Head", "Neck", "Head", True)}
-    for side, _ in SIDES:
-        hand_end = f"Middle1_{side}" if f"Middle1_{side}" in base_pos else f"Hand_{side}"
-        specs[f"Clavicle_{side}"] = (f"Clavicle_{side}", f"Shoulder_{side}", f"Clavicle_{side}", f"Shoulder_{side}", True)
-        specs[f"Shoulder_{side}"] = (f"Shoulder_{side}", f"Elbow_{side}", f"Shoulder_{side}", f"Elbow_{side}", True)
-        specs[f"Elbow_{side}"] = (f"Elbow_{side}", f"Hand_{side}", f"Elbow_{side}", f"Hand_{side}", True)
-        if hand_end != f"Hand_{side}":
-            specs[f"Hand_{side}"] = (f"Hand_{side}", f"HandTip_{side}", f"Hand_{side}", hand_end, False)
-        specs[f"Thigh_{side}"] = (f"Thigh_{side}", f"Knee_{side}", f"Thigh_{side}", pick_bone(base_pos, f"Knee_{side}", f"Knee_Break_{side}"), True)
-        specs[f"Knee_{side}"] = (f"Knee_{side}", f"Ankle_{side}", pick_bone(base_pos, f"Knee_{side}", f"Knee_Break_{side}"), pick_bone(base_pos, f"Ankle_{side}", f"Ankle_Break_{side}"), True)
-    out = {}
-    for bone, (sj, sc, lj, lc, axial) in specs.items():
-        limb = bone.startswith(("Shoulder_", "Elbow_", "Thigh_", "Knee_"))
-        out[bone] = segment_transform(anchors[sj], anchors[sc], base_pos[lj], base_pos[lc], axial, thicken=limb)
-    if "Hand_Left" not in out:
-        for side, _ in SIDES:
-            out[f"Hand_{side}"] = (np.eye(3), base_pos[f"Hand_{side}"] - anchors[f"Hand_{side}"])
-    out["Head"] = (np.eye(3), base_pos["Head"] - anchors["Head"])
-    for side, _ in SIDES:
-        foot_bone = pick_bone(base_pos, f"Ankle_{side}", f"Ankle_Break_{side}")
-        foot = (np.eye(3), base_pos[foot_bone] - anchors[f"Ankle_{side}"])
-        out[f"Ankle_{side}"] = foot
-        out[f"Ball_{side}"] = foot
-    return out
-
-
-def weld(positions, faces):
-    keys = np.round(positions / 1e-5).astype(np.int64)
-    _, weld_id, inverse = np.unique(keys, axis=0, return_index=True, return_inverse=True)
-    inverse = inverse.reshape(-1)
-    wverts = positions[weld_id]
-    wfaces = inverse[faces]
-    ok = (wfaces[:, 0] != wfaces[:, 1]) & (wfaces[:, 1] != wfaces[:, 2]) & (wfaces[:, 0] != wfaces[:, 2])
-    return wverts, wfaces, inverse, ok
-
-
-def run_heat(wverts, wfaces, anchors, tag):
-    bones = heat_bones()
-    hdir = BUILD / "heat" / tag
-    hdir.mkdir(parents=True, exist_ok=True)
-    src, dst = hdir / "heat_in.npz", hdir / "heat_out.npz"
-    np.savez(src, verts=wverts, faces=wfaces,
-             bone_names=np.array([b[0] for b in bones]),
-             heads=np.array([anchors[b[1]] for b in bones]),
-             tails=np.array([anchors[b[2]] for b in bones]),
-             parents=np.array([b[3] for b in bones]))
-    res = subprocess.run([str(BLENDER), "-b", "--factory-startup", "--python", str(HEAT_SCRIPT), "--", str(src), str(dst)],
-                         capture_output=True, text=True)
-    if res.returncode != 0 or not dst.exists():
-        raise RuntimeError(f"Blender heat weighting failed for {tag}:\n{res.stdout}\n{res.stderr}")
-    weights = np.load(dst)["weights"]
-    empty = weights.sum(1) <= 1e-6
-    if empty.all():
-        print(f"  [heat] Blender bone-heat failed for {tag}; using smooth bone-segment envelope weights")
-        # Distance from each vertex to each bone segment [head, tail]
-        heads = np.array([anchors[b[1]] for b in bones])
-        tails = np.array([anchors[b[2]] for b in bones])
-        seg = tails - heads
-        seg_len2 = np.maximum((seg * seg).sum(1), 1e-8)
-        # (N, B, 3)
-        diff = wverts[:, None, :] - heads[None, :, :]
-        t = np.clip((diff * seg[None, :, :]).sum(2) / seg_len2[None, :], 0.0, 1.0)
-        proj = heads[None, :, :] + t[:, :, None] * seg[None, :, :]
-        dist2 = ((wverts[:, None, :] - proj) ** 2).sum(2)
-        weights = 1.0 / np.maximum(dist2, 1e-5) ** 2.0
-        weights /= weights.sum(1, keepdims=True)
-    elif empty.any():
-        tree = cKDTree(wverts[~empty])
-        _, nearest = tree.query(wverts[empty])
-        weights[empty] = weights[~empty][nearest]
-    names = [b[0] for b in bones]
-    # Remove cross-side weights below hips
-    below = wverts[:, 1] < anchors["Hips"][1] * 0.9
-    for side, sx in SIDES:
-        other = "Right" if side == "Left" else "Left"
-        rows = below & (np.sign(wverts[:, 0]) == sx)
-        for col, bname in enumerate(names):
-            if bname.endswith(other):
-                mirror = names.index(bname[:-len(other)] + side)
-                weights[rows, mirror] += weights[rows, col]
-                weights[rows, col] = 0.0
-    return names, weights
-
-
-def quantize_weights(weights, bone_cols):
-    order = np.argsort(-weights, axis=1)[:, :4]
-    top = np.take_along_axis(weights, order, 1)
-    top = top / np.maximum(top.sum(1, keepdims=True), 1e-9)
-    q = np.floor(top * 255).astype(int)
-    rem = 255 - q.sum(1)
-    frac = top * 255 - q
-    for i in np.nonzero(rem)[0]:
-        for j in np.argsort(-frac[i])[:rem[i]]:
-            q[i, j] += 1
-    idx = bone_cols[order]
-    idx[q == 0] = idx[:, :1].repeat(4, 1)[q == 0]
-    return idx.astype(np.uint8), q.astype(np.uint8)
+    return out_pos, out_nrm
 
 
 def vertex_normals(verts, faces):
@@ -582,7 +500,6 @@ def patch_oct(base_info, n_body: int, idx_count: int, bounds, base_name: str, ne
     replace_unique(i24(base_info["vbuf_len"]), i24(new_vbuf_len), "vbuf_len")
     replace_first(i24(base_info["ibuf_len"]), i24(new_ibuf_len), "ibuf_len")
 
-    # Patch each primitive
     for k, prim in enumerate(base_info["prims"]):
         if k == 0:
             new_vals = (0, 0, 0, idx_count)
@@ -598,7 +515,6 @@ def patch_oct(base_info, n_body: int, idx_count: int, bounds, base_name: str, ne
         if all(0 <= x <= 65535 for x in prim["idata"]) and data.find(u16(*prim["idata"])) >= 0:
             old_u16 = u16(*prim["idata"])
             pos_i = data.find(old_u16)
-            assert pos_i >= 0
             data[pos_i:pos_i + len(old_u16)] = u16(*new_vals)
         else:
             pos_i = data.find(old_i24)
@@ -613,7 +529,6 @@ def patch_oct(base_info, n_body: int, idx_count: int, bounds, base_name: str, ne
     bmin, bmax, center, radius = bounds
     replace_unique(f32(*base_info["bbox"]), f32(*bmin, *bmax), "bbox")
 
-    # Equal-length material / filename swaps
     lbase, lname = base_name.lower(), new_name.lower()
     out = bytes(data)
     out = out.replace(f"{lbase}_0.vbuf\0".encode(), f"{lname}_0.vbuf\0".encode())
@@ -625,41 +540,17 @@ def patch_oct(base_info, n_body: int, idx_count: int, bounds, base_name: str, ne
 
 def patch_mtb(base_info, spec):
     data = bytearray(base_info["mtb"])
-    # In TEXB (bytes 32..144), first two 8-byte entries (separated by ffffffff) are Prim[0] diffuse + normal
     old_diff = data[36:44]
     old_norm = data[48:56]
     new_diff = bytes.fromhex(spec["diff_hash"])
     new_norm = bytes.fromhex(spec["norm_hash"])
     data = bytearray(bytes(data).replace(old_diff, new_diff).replace(old_norm, new_norm))
 
-    # Replace first MATP GUID (36-byte ASCII UUID) and first 4-byte material hash after MATP
-    matp = data.find(b"MATP")
-    assert matp >= 0
     guids = list(re.finditer(rb"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", data))
     assert guids, "no GUID in mtb"
     g0 = guids[0]
     data[g0.start():g0.end()] = spec["mat_guid"]
-    # Replace first 4-byte hash right after MATP header (at matp + 12 or inside first material block)
-    # In DI3 mtb, the 4-byte MATP hash is at the end of the first material entry or near the GUID
-    # Let's mutate a unique 4-byte tag or the hash right before the GUID:
-    # Actually, let's replace bytes at g0.start()-8..g0.start()-4 if non-zero, or check!
     return bytes(data)
-
-
-def render_preview(verts, faces, colors, path, joints=None, view="front", size=(600, 800)):
-    w, h = size
-    s = h / 2.6
-    img = Image.new("RGB", size, (24, 24, 28))
-    dr = ImageDraw.Draw(img)
-    ax, depth, sign = (0, 2, 1.0) if view == "front" else (2, 0, 1.0)
-    order = np.argsort(verts[faces].mean(1)[:, depth] * (1 if view == "front" else -1))
-    for f in order:
-        p = verts[faces[f]]
-        dr.polygon([(w / 2 + sign * q[ax] * s, h - 40 - q[1] * s) for q in p], fill=tuple(int(c) for c in colors[f]))
-    for pt in joints if joints is not None else []:
-        x, y = w / 2 + pt[ax] * s, h - 40 - pt[1] * s
-        dr.ellipse([x - 2, y - 2, x + 2, y + 2], outline=(0, 220, 100), width=1)
-    img.save(path)
 
 
 def build_b3_texture_zip(tex_out: Path) -> Path:
@@ -681,12 +572,10 @@ def build_b3_texture_zip(tex_out: Path) -> Path:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--no-previews", action="store_true")
-    args = parser.parse_args()
+    parser.parse_args()
 
     shutil.rmtree(MOD_OUT, ignore_errors=True)
     MOD_OUT.mkdir(parents=True)
-    PREVIEWS.mkdir(parents=True, exist_ok=True)
     tex_out = BUILD / "textures"
     tex_out.mkdir(parents=True, exist_ok=True)
 
@@ -700,90 +589,53 @@ def main():
         assert len(name) == len(base), (name, base)
         print(f"\n=== Building {name} (from TS3 {spec['ts3_dir']} -> DI3 {base}) ===")
 
-        pos, nrm, faces_n, faces = None, None, None, None
-        ts_pos, ts_nrm, ts_uv, ts_faces, atlas = load_ts3_character(spec)
+        ts_pos, ts_nrm, ts_uv, ts_faces, ts_bnames, ts_bw, ts3_bone_pos, atlas = load_ts3_character(spec)
         base_info = load_di3_base(base)
 
         bone_names = base_info["bone_names"]
         bone_world = base_info["bone_world"]
-        base_pos = {bn: bone_world[i][3, :3] for i, bn in enumerate(bone_names)}
+        di3_pos = {bn: bone_world[i][3, :3] for i, bn in enumerate(bone_names)}
 
-        # Compute scale to match DI3 base height (or 1.05x for Zurg)
         ts_h = float(ts_pos[:, 1].max() - ts_pos[:, 1].min())
         di_h = float(base_info["bbox"][4] - base_info["bbox"][1])
         scale = (di_h / ts_h) if spec["scale_to_base"] else 1.0
 
-        anchors = make_tpose_anchors(ts_pos, base_pos, scale)
+        # Scale uniformly and place feet at y=0
         scaled_pos = ts_pos * scale
+        scaled_pos[:, 1] -= float(scaled_pos[:, 1].min())
 
-        # Compute winding sign of TS3 mesh
-        fn = np.cross(scaled_pos[ts_faces[:, 1]] - scaled_pos[ts_faces[:, 0]],
-                      scaled_pos[ts_faces[:, 2]] - scaled_pos[ts_faces[:, 0]])
-        ts_sign = float(np.sign(np.median((fn * ts_nrm[ts_faces].mean(1)).sum(1))))
-
-        # Weld and run Blender heat weights
-        wverts, wfaces, c2w, ok = weld(scaled_pos, ts_faces)
-        ts_faces = ts_faces[ok]
-        heat_names, heat_w = run_heat(wverts, wfaces[ok], anchors, lname)
-        above_head = wverts[:, 1] >= anchors["Head"][1]
-        heat_w[above_head] = 0.0
-        heat_w[above_head, heat_names.index("Head")] = 1.0
-
-        # Deduplicate (weld_id, uv)
-        uv_key = np.round(ts_uv * 65536).astype(np.int64)
-        keys = np.c_[c2w, uv_key]
-        _, first, remap = np.unique(keys, axis=0, return_index=True, return_inverse=True)
-        remap = remap.reshape(-1)
-        vweld = c2w[first]
-        vuv = ts_uv[first]
-        vfaces = remap[ts_faces]
-        if base_info["winding"] * ts_sign < 0:
-            vfaces = vfaces[:, ::-1]
-
-        # Bake T-pose into DI3 A-pose
-        bake = bake_transforms(anchors, base_pos)
-        w = heat_w[vweld]
-        tpose = wverts[vweld]
-        tnormals = ts_sign * vertex_normals(wverts, wfaces[ok])[vweld]
-        baked = np.zeros_like(tpose)
-        bnormals = np.zeros_like(tpose)
-        for col, bname in enumerate(heat_names):
-            if bname not in bake:
-                continue
-            m, t = bake[bname]
-            baked += w[:, col:col + 1] * (tpose @ m + t)
-            bnormals += w[:, col:col + 1] * (tnormals @ np.linalg.inv(m).T)
+        # Rotate ONLY the arms from T-pose into DI3's A-pose
+        baked, bnormals = rotate_arms_to_apose(scaled_pos, ts_nrm, ts_bnames, ts_bw, ts3_bone_pos, di3_pos, scale)
         bnormals /= np.maximum(np.linalg.norm(bnormals, axis=1, keepdims=True), 1e-12)
-        tangents, tsign = vertex_tangents(baked, vuv, bnormals, vfaces)
 
-        # Map heat bones -> DI3 skeleton bone indices
-        bone_cols = []
-        for hn in heat_names:
-            if hn in bone_names:
-                bone_cols.append(bone_names.index(hn))
-            elif hn.startswith("Knee_") and hn.replace("Knee_", "Knee_Break_") in bone_names:
-                bone_cols.append(bone_names.index(hn.replace("Knee_", "Knee_Break_")))
-            elif hn.startswith("Ankle_") and hn.replace("Ankle_", "Ankle_Break_") in bone_names:
-                bone_cols.append(bone_names.index(hn.replace("Ankle_", "Ankle_Break_")))
-            elif hn.startswith("Ball_"):
-                side = hn.split("_", 1)[1]
-                b = pick_bone(base_pos, f"Ball_{side}", f"Toes_{side}", f"Toes_Break_{side}", f"Ankle_{side}", f"Ankle_Break_{side}")
-                bone_cols.append(bone_names.index(b))
-            elif hn == "Spine2" and "Spine1" in bone_names:
-                bone_cols.append(bone_names.index("Spine1"))
-            else:
-                bone_cols.append(bone_names.index("Hips"))
-        bone_cols = np.array(bone_cols)
-        idx, wq = quantize_weights(w, bone_cols)
+        # Check winding sign against DI3 base
+        fn = np.cross(baked[ts_faces[:, 1]] - baked[ts_faces[:, 0]], baked[ts_faces[:, 2]] - baked[ts_faces[:, 0]])
+        ts_sign = float(np.sign(np.median((fn * bnormals[ts_faces].mean(1)).sum(1))))
+        vfaces = ts_faces[:, ::-1] if (base_info["winding"] * ts_sign < 0) else ts_faces
+        if base_info["winding"] * ts_sign < 0:
+            bnormals = -bnormals
 
-        # Build vbuf + ibuf with 1 hidden degenerate triangle per extra primitive (1..4)
+        # Recompute smooth vertex normals & tangents on the posed mesh
+        bnormals = vertex_normals(baked, vfaces) * base_info["winding"]
+        tangents, tsign = vertex_tangents(baked, ts_uv, bnormals, vfaces)
+
+        # Map TS3 bone names directly to DI3 skeleton indices
+        bone_cache = {}
+        idx = np.zeros_like(ts_bw, dtype=np.uint8)
+        for vi, row in enumerate(ts_bnames):
+            for k, bn in enumerate(row):
+                if bn not in bone_cache:
+                    bone_cache[bn] = bone_names.index(map_ts3_bone_to_di3(bn, bone_names))
+                idx[vi, k] = bone_cache[bn]
+        wq = ts_bw.astype(np.uint8)
+
         n_body = len(baked)
         n_dummy_tris = len(base_info["prims"]) - 1
         n_dummy_verts = n_dummy_tris * 3
-        head_c = base_pos["Head"] + np.array([0.0, 0.05, 0.0])
+        head_c = di3_pos["Head"] + np.array([0.0, 0.05, 0.0])
         dummy_pos = np.repeat(head_c[None], n_dummy_verts, 0)
         all_pos = np.vstack([baked, dummy_pos]).astype("<f4")
-        all_uv = np.vstack([vuv, np.zeros((n_dummy_verts, 2))]).astype("<f2")
+        all_uv = np.vstack([ts_uv, np.zeros((n_dummy_verts, 2))]).astype("<f2")
         all_idx = np.vstack([idx, np.full((n_dummy_verts, 4), bone_names.index("Head"), np.uint8)])
         all_w = np.vstack([wq, np.tile(np.array([255, 0, 0, 0], np.uint8), (n_dummy_verts, 1))])
         all_n = np.vstack([bnormals, np.tile([0.0, 0.0, 1.0], (n_dummy_verts, 1))])
@@ -815,7 +667,6 @@ def main():
         (char_dir / f"{lname}.mtb").write_bytes(patch_mtb(base_info, spec))
         (char_dir / f"{lname}.animtreeoverrides").write_bytes(base_info["anim"])
 
-        # Patch .bent and .dnax
         bent = base_info["bent"].replace(f"characters/{lbase}/{lbase}.oct\0".encode(), f"characters/{lname}/{lname}.oct\0".encode())
         (char_dir / f"{lname}.bent").write_bytes(bent)
 
@@ -824,11 +675,9 @@ def main():
         dnax = re.sub(rb"characters/" + lbase.encode() + rb"/" + lbase.encode() + rb"\.animtreeoverrides(?=\x00)", model_path + b".animtreeoverrides", dnax, flags=re.IGNORECASE)
         (char_dir / f"{lname}.dnax").write_bytes(dnax)
 
-        # Write textures
         write_dds(atlas, "DXT1", tex_out / f"{spec['diff_hash']}.tbody")
         write_dds(Image.new("RGBA", (256, 256), FLAT_NORMAL_RGBA), "DXT5", tex_out / f"{spec['norm_hash']}.tbody")
 
-        # Write characters/<Name>.lua
         (MOD_OUT / "characters" / f"{name}.lua").write_text(
             f"-- {name} (Toy Story 3 port, cloned from {base})\n"
             "Crabe.VirtualReader.exposeCharacter({\n"
@@ -838,24 +687,13 @@ def main():
 
         actor_patches.append((lbase, lname, name))
         datamap_patches.append((lbase, lname))
-
-        if not args.no_previews:
-            atl = np.array(atlas)
-            fuv = vuv[vfaces].mean(1)
-            colors = atl[(np.clip(fuv[:, 1], 0, 0.999) * ATLAS_SIZE).astype(int),
-                         (np.clip(fuv[:, 0], 0, 0.999) * ATLAS_SIZE).astype(int)]
-            render_preview(baked, vfaces, colors, PREVIEWS / f"{lname}_front.png", joints=list(base_pos.values()), view="front")
-            render_preview(baked, vfaces, colors, PREVIEWS / f"{lname}_side.png", joints=list(base_pos.values()), view="side")
-
         print(f"  OK: {n_body} verts, {len(vfaces)} tris, bbox={bmin.round(2)}..{bmax.round(2)}")
 
-    # Build textures/b3.zip
     print("\n=== Packing textures/b3.zip ===")
     b3_zip = build_b3_texture_zip(tex_out)
     (MOD_OUT / "textures").mkdir(parents=True, exist_ok=True)
     shutil.copy2(b3_zip, MOD_OUT / "textures" / "b3.zip")
 
-    # Write skilltrees/ActorList.patch & DataMap.patch
     skill_dir = MOD_OUT / "skilltrees"
     skill_dir.mkdir(parents=True, exist_ok=True)
 
@@ -908,7 +746,6 @@ def main():
         ])
     (skill_dir / "DataMap.patch").write_text("\n".join(dm_lines) + "\n", encoding="utf-8")
 
-    # Copy mod.json and ts3_characters.lua into MOD_OUT
     shutil.copy2(MOD_ROOT / "mod.json", MOD_OUT / "mod.json")
     shutil.copy2(MOD_ROOT / "ts3_characters.lua", MOD_OUT / "ts3_characters.lua")
     print(f"\n[DONE] Mod built cleanly at: {MOD_OUT}")
