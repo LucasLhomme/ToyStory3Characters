@@ -19,8 +19,9 @@ scene.cycles.samples = 96
 scene.cycles.use_denoising = True
 scene.render.film_transparent = True
 scene.render.resolution_x = scene.render.resolution_y = 512
-scene.view_settings.view_transform = "AgX"
-scene.view_settings.look = "AgX - Medium High Contrast"
+# Standard keeps the texture colours as painted, like the game's own icons (AgX washed them out)
+scene.view_settings.view_transform = "Standard"
+scene.view_settings.look = "None"
 world = bpy.data.worlds.new("Portrait")
 scene.world = world
 world.use_nodes = True
@@ -29,7 +30,7 @@ bg = wn.get("Background") or wn.new("ShaderNodeBackground")
 out_node = wn.get("World Output") or wn.new("ShaderNodeOutputWorld")
 world.node_tree.links.new(bg.outputs["Background"], out_node.inputs["Surface"])
 bg.inputs["Color"].default_value = (0.25, 0.3, 0.4, 1)
-bg.inputs["Strength"].default_value = 0.8
+bg.inputs["Strength"].default_value = 0.3
 
 cam = bpy.data.objects.new("portrait_cam", bpy.data.cameras.new("portrait_cam"))
 scene.collection.objects.link(cam)
@@ -44,8 +45,8 @@ def area(name, energy, size, color):
     return light
 
 
-key, fill, rim = (area("key", 700, 2.5, (1.0, 0.95, 0.88)), area("fill", 250, 4, (0.8, 0.88, 1.0)),
-                  area("rim", 900, 2, (0.75, 0.85, 1.0)))
+key, fill, rim = (area("key", 1, 2.5, (1.0, 0.95, 0.88)), area("fill", 1, 4, (0.8, 0.88, 1.0)),
+                  area("rim", 1, 2, (0.75, 0.85, 1.0)))
 
 
 def aim(obj, target):
@@ -71,8 +72,11 @@ for name in CHARS:
         cam.location = centre + Vector((math.sin(yaw) * 6, -math.cos(yaw) * 6, 0.3 * size))
         aim(cam, centre)
         cam.data.ortho_scale = size * 1.05
-        for light, offset in ((key, (-3, -3, 2)), (fill, (3, -2, 0.5)), (rim, (1.5, 3, 2))):
-            light.location = centre + Vector(offset)
+        # Lights sit at a distance proportional to the frame, so a head gets the same exposure as a bust
+        for light, offset, energy in ((key, (-3, -3, 2), 260), (fill, (3, -2, 0.5), 90), (rim, (1.5, 3, 2), 320)):
+            light.location = centre + Vector(offset) * size
+            light.data.energy = energy * size * size
+            light.data.size = 1.2 * size
             aim(light, centre)
         scene.render.filepath = str(OUT / f"{name}_{frame}.png")
         bpy.ops.render.render(write_still=True)
