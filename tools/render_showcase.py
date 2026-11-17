@@ -34,8 +34,9 @@ for backend in ("OPTIX", "CUDA", "HIP", "ONEAPI"):
     except TypeError:
         continue
 scene.render.resolution_x, scene.render.resolution_y = 1920, 1080
-scene.view_settings.view_transform = "AgX"
-scene.view_settings.look = "AgX - Medium High Contrast"
+# Standard keeps the texture colours as painted (AgX desaturated the lit areas)
+scene.view_settings.view_transform = "Standard"
+scene.view_settings.look = "None"
 
 # Studio world: soft blue-grey ambient
 world = bpy.data.worlds.new("Studio")
@@ -46,7 +47,7 @@ bg = wn.get("Background") or wn.new("ShaderNodeBackground")
 out_node = wn.get("World Output") or wn.new("ShaderNodeOutputWorld")
 world.node_tree.links.new(bg.outputs["Background"], out_node.inputs["Surface"])
 bg.inputs["Color"].default_value = (0.05, 0.06, 0.09, 1)
-bg.inputs["Strength"].default_value = 0.6
+bg.inputs["Strength"].default_value = 0.35
 
 # Curved backdrop (cyclorama) so the floor melts into the background
 bpy.ops.mesh.primitive_plane_add(size=1)
@@ -147,7 +148,7 @@ def shoot(visible, path, yaw_deg):
     lights[2].location = centre + Vector((1.2 * r, 2.5 * r, 1.8 * r))
     for light, base in zip(lights, BASE_ENERGY):
         aim(light, centre)
-        light.data.energy = base * (r / 2.2) ** 2  # tuned on a 2.2 m figure, scaled with distance
+        light.data.energy = 0.6 * base * (r / 2.2) ** 2  # tuned on a 2.2 m figure, scaled with distance
     scene.render.filepath = str(path)
     bpy.ops.render.render(write_still=True)
     print("showcase render", path.name)
