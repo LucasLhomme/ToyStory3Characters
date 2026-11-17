@@ -1,0 +1,31 @@
+# Pushing a tag vX.Y.Z builds the mod on the self-hosted runner (the only machine with the game installs, Blender
+# and the DIM2 tools) and opens a draft release with dist/ts3_characters-X.Y.Z.zip, ready for Nexus Mods.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: [self-hosted, windows]
+    env:
+      DIM2_ROOT: E:\Dev\DIM2
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and package
+        shell: powershell
+        run: .\tools\package.ps1 -Version "$("${{ github.ref_name }}".TrimStart('v'))"
+
+      - name: Draft release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart('v')
+          gh release create "${{ github.ref_name }}" "dist\ts3_characters-$v.zip" --draft --title "Toy Story 3 Characters $v" --generate-notes
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

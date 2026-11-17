@@ -23,7 +23,8 @@ from PIL import Image
 from scipy.spatial.transform import Rotation
 
 MOD_ROOT = Path(__file__).resolve().parent
-DIM2 = MOD_ROOT.parent
+# The tool folders (CrabeLoader/tools, DisneyInfinityCreator) sit next to this repo; a CI checkout elsewhere sets DIM2_ROOT
+DIM2 = Path(os.environ.get("DIM2_ROOT", MOD_ROOT.parent))
 TOOLS = DIM2 / "CrabeLoader" / "tools"
 QUICKBMS = TOOLS / "QuickBMS" / "quickbms.exe"
 BMS_SCRIPT = TOOLS / "QuickBMS" / "disney_infinity_new.bms"
