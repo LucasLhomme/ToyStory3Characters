@@ -19,7 +19,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 from scipy.spatial.transform import Rotation
 
 MOD_ROOT = Path(__file__).resolve().parent
@@ -749,53 +749,85 @@ CREATOR = DIM2 / "DisneyInfinityCreator"
 ICONS = BUILD / "icons"
 
 
-# Virtual Reader pictures (figure, small, glowing silhouette) from build/icons/<char>_body.png (tools/render_icons.py).
-# The game reads ui/virtualreadercharacters only from its archive, so the mod ships a rebuilt copy: vanilla entries
-# byte for byte + ours, built and read back by DisneyInfinityCreator's shared._build (same layout as its own icons).
+def _premultiply(img: Image.Image) -> Image.Image:
+    a = np.asarray(img.convert("RGBA"), np.float32)
+    a[..., :3] *= a[..., 3:] / 255.0
+    return Image.fromarray(a.round().astype(np.uint8), "RGBA")
+
+
+def _unpremultiply(img: Image.Image) -> Image.Image:
+    a = np.asarray(img, np.float32)
+    alpha = a[..., 3:]
+    a[..., :3] = np.where(alpha > 0, a[..., :3] * 255.0 / np.maximum(alpha, 1), 0)
+    return Image.fromarray(a.clip(0, 255).round().astype(np.uint8), "RGBA")
+
+
+def _resize(img: Image.Image, size: int) -> Image.Image:
+    """Resize in premultiplied space, so transparent black does not darken the outline."""
+    return _unpremultiply(_premultiply(img).resize((size, size), Image.LANCZOS))
+
+
+def _bleed(img: Image.Image) -> Image.Image:
+    """Fill the colour of transparent pixels from their neighbours, like the game's own UI pictures: the game
+    filters these textures, and a black colour under alpha 0 shows up as a dark or light fringe."""
+    pm = _premultiply(img)
+    a = np.asarray(img, np.float32)
+    acc, wsum = np.zeros(a.shape[:2] + (3,), np.float32), np.zeros(a.shape[:2] + (1,), np.float32)
+    for radius in (2, 6, 16, 40):
+        blur = np.asarray(pm.filter(ImageFilter.GaussianBlur(radius)), np.float32)
+        wsum += blur[..., 3:]
+        acc += blur[..., :3]
+    fill = acc * 255.0 / np.maximum(wsum, 1e-3)
+    out = a.copy()
+    hole = a[..., 3] == 0
+    out[hole, :3] = fill[hole]
+    return Image.fromarray(out.clip(0, 255).round().astype(np.uint8), "RGBA")
+
+
+def ui_tbody(img: Image.Image) -> bytes:
+    """Uncompressed 32-bit BGRA DDS with the header of the game's av_ pictures (no DXT blocks on edges)."""
+    w, h = img.size
+    header = struct.pack("<4s7I44s2I4s5I5I", b"DDS ", 124, 0x100F, h, w, w * 4, 0, 1, b"\x00" * 44,
+                         32, 0x41, b"\x00\x00\x00\x00", 32, 0xFF0000, 0xFF00, 0xFF, 0xFF000000,
+                         0x1000, 0, 0, 0x49, 0)
+    rgba = np.asarray(_bleed(img.convert("RGBA")))
+    return header + rgba[..., [2, 1, 0, 3]].tobytes()
+
+
+# UI pictures from build/icons (tools/render_portraits.py): Virtual Reader figure, small figure and glowing silhouette
+# (virtualreadercharacters.zip), grid tile av_<Icon suffix> and HUD portrait (icons.zip; the grid derives the tile
+# from the row's Icon, HUD_PlayerIcons_Buzz -> av_buzz). The game reads both folders only from their archives, so
+# the mod ships rebuilt copies: vanilla entries byte for byte + ours, built and read back by DisneyInfinityCreator.
 def build_reader_icons():
     sys.path.insert(0, str(CREATOR))
     from src.core import icon, shared
 
-    files = {}
     stage = BUILD / "icons_stage"
     shutil.rmtree(stage, ignore_errors=True)
-    for spec in CHARACTERS:
-        lname = spec["name"].lower()
-        body = ICONS / f"{lname}_body.png"
-        if not body.exists():
-            print(f"  no icon render for {lname} (run tools/render_icons.py)")
-            continue
-        figure = icon.figure_icon(Image.open(body))
-        pictures = {lname: figure, f"{lname}_sm": figure.resize((icon.SMALL_SIZE,) * 2, Image.LANCZOS),
-                    f"{lname}_s": icon.silhouette_icon(figure)}
-        for name, pic in pictures.items():
-            tex = icon.texture_hash(name)
-            (stage / "textures").mkdir(parents=True, exist_ok=True)
-            (stage / f"{name}.mtb").write_bytes(icon.ui_bundle(name, tex))
-            (stage / "textures" / f"{tex}.tbody").write_bytes(icon.dds_single(pic))
-            files[f"virtualreadercharacters/{name}.mtb"] = stage / f"{name}.mtb"
-            files[f"virtualreadercharacters/textures/{tex}.tbody"] = stage / "textures" / f"{tex}.tbody"
-    # Character grid tile av_<icon suffix> (256 px bust) and HUD portrait hud_playericons_<name> (128 px head):
-    # the grid derives its tile from the row's Icon (HUD_PlayerIcons_Buzz -> av_buzz), both live in icons.zip.
-    grid = {}
-    for spec in CHARACTERS:
-        lname = spec["name"].lower()
-        bust, head = ICONS / f"{lname}_bust.png", ICONS / f"{lname}_head.png"
-        if not (bust.exists() and head.exists()):
-            print(f"  no portrait render for {lname} (run tools/render_portraits.py)")
-            continue
-        tile = Image.open(bust).convert("RGBA").resize((256, 256), Image.LANCZOS)
-        framed = icon._glow(tile.getchannel("A"), 3)
-        framed.alpha_composite(tile)
-        for name, pic in ((f"av_{lname}", framed), (icon.hud_name(spec["name"]).lower(), icon.hud_icon(Image.open(head)))):
-            tex = icon.texture_hash(name)
-            (stage / "textures").mkdir(parents=True, exist_ok=True)
-            (stage / f"{name}.mtb").write_bytes(icon.ui_bundle(name, tex))
-            (stage / "textures" / f"{tex}.tbody").write_bytes(icon.dds_single(pic))
-            grid[f"icons/{name}.mtb"] = stage / f"{name}.mtb"
-            grid[f"icons/textures/{tex}.tbody"] = stage / "textures" / f"{tex}.tbody"
+    (stage / "textures").mkdir(parents=True)
+    archives = {"virtualreadercharacters": {}, "icons": {}}
 
-    for stem, ours in (("virtualreadercharacters", files), ("icons", grid)):
+    def add(stem, name, pic):
+        tex = icon.texture_hash(name)
+        (stage / f"{name}.mtb").write_bytes(icon.ui_bundle(name, tex))
+        (stage / "textures" / f"{tex}.tbody").write_bytes(ui_tbody(pic))
+        archives[stem][f"{stem}/{name}.mtb"] = stage / f"{name}.mtb"
+        archives[stem][f"{stem}/textures/{tex}.tbody"] = stage / "textures" / f"{tex}.tbody"
+
+    for spec in CHARACTERS:
+        lname = spec["name"].lower()
+        renders = {k: ICONS / f"{lname}_{k}.png" for k in ("figure", "tile", "head")}
+        if not all(p.exists() for p in renders.values()):
+            print(f"  no UI renders for {lname} (run tools/render_portraits.py)")
+            continue
+        figure = _unpremultiply(icon.figure_icon(_premultiply(Image.open(renders["figure"]))))
+        add("virtualreadercharacters", lname, figure)
+        add("virtualreadercharacters", f"{lname}_sm", _resize(figure, icon.SMALL_SIZE))
+        add("virtualreadercharacters", f"{lname}_s", icon.silhouette_icon(figure))
+        add("icons", f"av_{lname}", _resize(Image.open(renders["tile"]), 256))
+        add("icons", icon.hud_name(spec["name"]).lower(), icon.hud_icon(_resize(Image.open(renders["head"]), icon.HUD_SIZE)))
+
+    for stem, ours in archives.items():
         if not ours:
             continue
         vanilla = DI3_GAME / "assets" / "ui" / stem / f"{stem}.zip"

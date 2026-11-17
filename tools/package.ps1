@@ -27,7 +27,6 @@ if (-not (Test-Path $Blender)) { throw "Blender not found at $Blender (set BLEND
 Invoke-Step "build (meshes)" { python build_ts3_characters.py }
 Invoke-Step "blender scene data" { python tools\export_blender_data.py }
 Invoke-Step "blender scene" { & $Blender -b --python tools\blender_scene.py }
-Invoke-Step "figure renders" { & $Blender -b build\blender_scene\ts3_characters.blend --python tools\render_icons.py }
 Invoke-Step "portrait renders" { & $Blender -b build\blender_scene\ts3_characters.blend --python tools\render_portraits.py }
 Invoke-Step "build (with icons)" { python build_ts3_characters.py }
 

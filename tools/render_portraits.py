@@ -1,4 +1,4 @@
-"""Cycles portraits on transparency for the character grid: build/icons/<char>_bust.png and <char>_head.png (512 px).
+"""Cycles portraits on transparency for the UI: build/icons/<char>_{tile,head,figure}.png (512 px).
 
 Run: blender -b build/blender_scene/ts3_characters.blend --python tools/render_portraits.py
 """
@@ -10,8 +10,10 @@ from mathutils import Vector
 
 OUT = pathlib.Path(bpy.data.filepath).resolve().parents[1] / "icons"
 CHARS = ["t3_woody", "t3_jessie", "t3_buzz", "t3_zurg"]
-# Part of the figure's height framed from the top: bust down to the belt, head down to the chin.
-FRAMES = {"bust": 0.55, "head": 0.30}
+# Part of the figure's height framed from the top, and the empty margin above the head (share of the frame).
+# tile: grid tile, head to thighs like the game's av_ pictures (the grid shows its top part); head: HUD portrait;
+# figure: the whole character for the Virtual Reader.
+FRAMES = {"tile": (0.72, 0.06), "head": (0.30, 0.0), "figure": (1.0, 0.03)}
 
 scene = bpy.context.scene
 scene.render.engine = "CYCLES"
@@ -65,9 +67,9 @@ for name in CHARS:
     cx = sum(p.x for p in pts) / len(pts)
     cy = sum(p.y for p in pts) / len(pts)
     height = top - bottom
-    for frame, part in FRAMES.items():
+    for frame, (part, margin) in FRAMES.items():
         size = height * part
-        centre = Vector((cx, cy, top - size / 2))
+        centre = Vector((cx, cy, top - size / 2 + margin * size))
         yaw = math.radians(18)
         cam.location = centre + Vector((math.sin(yaw) * 6, -math.cos(yaw) * 6, 0.3 * size))
         aim(cam, centre)
